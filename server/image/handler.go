@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"path/filepath"
 	"strconv"
+	"time"
 
+	"github.com/esp32-rss-display/backend/server/api"
 	"github.com/esp32-rss-display/backend/server/config"
 	"github.com/esp32-rss-display/backend/server/database"
 	"github.com/esp32-rss-display/backend/server/metrics"
@@ -32,12 +34,33 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if id == uint64(api.PlaceholderItemID) {
+		card := h.renderer.GenerateColorCard(api.PlaceholderTitle)
+		h.renderer.OverlayTextFull(card, "System", api.PlaceholderTitle, time.Now().UTC())
+		encoded, err := h.renderer.EncodeJPEG(card)
+		if err != nil {
+			http.Error(w, "Failed to render image", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write(encoded)
+		return
+	}
+
 	db := database.GetDB()
 	metrics.ImageRenderTotal.Add(1)
 
 	var item models.Item
-	if err := db.Select("id", "title", "image_url", "published_at", "created_at").First(&item, id).Error; err != nil {
+	if err := db.Select("id", "feed_id", "title", "image_url", "published_at", "created_at").First(&item, id).Error; err != nil {
 		http.NotFound(w, r)
+		return
+	}
+
+	var feed models.Feed
+	if err := db.Select("name").First(&feed, item.FeedID).Error; err != nil {
+		http.Error(w, "Feed not found", http.StatusInternalServerError)
 		return
 	}
 
@@ -56,17 +79,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[image] render failed for item %d from %s: %v", item.ID, item.ImageURL, err)
 
 			card := h.renderer.GenerateColorCard(item.Title)
-			h.renderer.OverlayTextFull(card, item.Title, pubTime)
+			h.renderer.OverlayTextFull(card, feed.Name, item.Title, pubTime)
 			canvas = card
 		} else {
 			photo := h.renderer.ResizeImage(src)
-			h.renderer.OverlayText(photo, item.Title, pubTime)
+			h.renderer.OverlayText(photo, feed.Name, item.Title, pubTime)
 			canvas = photo
 		}
 	} else {
 		metrics.ImageColorCardTotal.Add(1)
 		card := h.renderer.GenerateColorCard(item.Title)
-		h.renderer.OverlayTextFull(card, item.Title, pubTime)
+		h.renderer.OverlayTextFull(card, feed.Name, item.Title, pubTime)
 		canvas = card
 	}
 

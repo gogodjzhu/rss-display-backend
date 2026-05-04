@@ -42,6 +42,7 @@ type Renderer struct {
 	imageHeight   int
 	httpClient    *http.Client
 	barFace       font.Face
+	badgeFace     font.Face
 	cardFace      font.Face
 	cardTimeFace  font.Face
 }
@@ -71,6 +72,7 @@ func NewRenderer(cfg *config.RSSConfig) *Renderer {
 		imageHeight:  cfg.ImageHeight,
 		httpClient:   &http.Client{Timeout: timeout},
 		barFace:      newWQYFace(13),
+		badgeFace:    newWQYFace(11),
 		cardFace:     newWQYFace(18),
 		cardTimeFace: newWQYFace(11),
 	}
@@ -194,7 +196,7 @@ func wrapText(face font.Face, text string, maxWidth, maxLines int) []string {
 // OverlayText draws a semi-transparent black bar at the bottom of img
 // (<= imgHeight/3) and renders the title (up to 3 wrapped lines) plus pubTime
 // in white. Used when a real photo is present as the background.
-func (r *Renderer) OverlayText(img *image.RGBA, title string, pubTime time.Time) {
+func (r *Renderer) OverlayText(img *image.RGBA, source, title string, pubTime time.Time) {
 	const (
 		margin   = 8
 		padTop   = 8
@@ -204,6 +206,7 @@ func (r *Renderer) OverlayText(img *image.RGBA, title string, pubTime time.Time)
 
 	imgW := img.Bounds().Max.X
 	imgH := img.Bounds().Max.Y
+	r.drawSourceBadge(img, source)
 	maxBarHeight := imgH / 3
 	lineHeight := (maxBarHeight - padTop) / maxRows
 
@@ -256,7 +259,7 @@ func (r *Renderer) OverlayText(img *image.RGBA, title string, pubTime time.Time)
 // Used for color-card images (no background photo) so the full height is
 // available for text. Title lines are centered horizontally and as a block
 // vertically; the timestamp sits at the bottom in a smaller font.
-func (r *Renderer) OverlayTextFull(img *image.RGBA, title string, pubTime time.Time) {
+func (r *Renderer) OverlayTextFull(img *image.RGBA, source, title string, pubTime time.Time) {
 	const (
 		margin        = 16
 		bottomPad     = 12
@@ -265,6 +268,7 @@ func (r *Renderer) OverlayTextFull(img *image.RGBA, title string, pubTime time.T
 
 	imgW := img.Bounds().Max.X
 	imgH := img.Bounds().Max.Y
+	r.drawSourceBadge(img, source)
 
 	cardMetrics := r.cardFace.Metrics()
 	timeMetrics := r.cardTimeFace.Metrics()
@@ -306,4 +310,56 @@ func (r *Renderer) OverlayTextFull(img *image.RGBA, title string, pubTime time.T
 	timeBaseline := imgH - bottomPad - timeMetrics.Descent.Round()
 	d.Dot = fixed.Point26_6{X: fixed.I(timeX), Y: fixed.I(timeBaseline)}
 	d.DrawString(timeStr)
+}
+
+func (r *Renderer) drawSourceBadge(img *image.RGBA, source string) {
+	if source == "" {
+		return
+	}
+
+	const (
+		marginX   = 8
+		marginY   = 8
+		paddingX  = 8
+		paddingY  = 5
+		maxWidth  = 150
+		badgeAlpha = 170
+	)
+
+	text := wrapText(r.badgeFace, source, maxWidth-2*paddingX, 1)
+	if len(text) == 0 || text[0] == "" {
+		return
+	}
+
+	label := text[0]
+	d := &font.Drawer{Face: r.badgeFace}
+	textWidth := d.MeasureString(label).Round()
+	metrics := r.badgeFace.Metrics()
+	textHeight := metrics.Height.Round()
+	badgeWidth := textWidth + 2*paddingX
+	badgeHeight := textHeight + 2*paddingY
+
+	maxX := img.Bounds().Max.X - marginX
+	maxY := img.Bounds().Max.Y - marginY
+	for y := marginY; y < marginY+badgeHeight && y < maxY; y++ {
+		for x := marginX; x < marginX+badgeWidth && x < maxX; x++ {
+			orig := img.RGBAAt(x, y)
+			img.SetRGBA(x, y, color.RGBA{
+				R: uint8((int(orig.R) * (255 - badgeAlpha)) / 255),
+				G: uint8((int(orig.G) * (255 - badgeAlpha)) / 255),
+				B: uint8((int(orig.B) * (255 - badgeAlpha)) / 255),
+				A: 255,
+			})
+		}
+	}
+
+	white := image.NewUniform(color.RGBA{R: 255, G: 255, B: 255, A: 255})
+	baseline := marginY + paddingY + metrics.Ascent.Round()
+	labelDrawer := &font.Drawer{
+		Dst:  img,
+		Src:  white,
+		Face: r.badgeFace,
+		Dot:  fixed.Point26_6{X: fixed.I(marginX + paddingX), Y: fixed.I(baseline)},
+	}
+	labelDrawer.DrawString(label)
 }

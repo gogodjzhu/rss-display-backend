@@ -28,6 +28,7 @@ type RSSConfig struct {
 	ImageWidth           int `yaml:"image_width"`
 	ImageHeight          int `yaml:"image_height"`
 	ImageDownloadTimeoutSeconds int `yaml:"image_download_timeout_seconds"`
+	FeedFetchTimeoutSeconds int `yaml:"feed_fetch_timeout_seconds"`
 }
 
 type FeedConfig struct {

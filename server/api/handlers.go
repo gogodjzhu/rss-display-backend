@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"github.com/esp32-rss-display/backend/server/database"
 	"github.com/esp32-rss-display/backend/server/metrics"
 	"github.com/esp32-rss-display/backend/server/models"
+	"gorm.io/gorm"
 )
 
 type NextItemResponse struct {
@@ -17,7 +19,29 @@ type NextItemResponse struct {
 	Source   string `json:"source"`
 }
 
+type Handler struct {
+	selector NextItemSelector
+	now      func() time.Time
+}
+
+func NewHandler(selector NextItemSelector) *Handler {
+	if selector == nil {
+		selector = NewWeightedNextItemSelector()
+	}
+
+	return &Handler{
+		selector: selector,
+		now:      time.Now,
+	}
+}
+
+var defaultHandler = NewHandler(nil)
+
 func GetNextItem(w http.ResponseWriter, r *http.Request) {
+	defaultHandler.GetNextItem(w, r)
+}
+
+func (h *Handler) GetNextItem(w http.ResponseWriter, r *http.Request) {
 	deviceID := r.PathValue("device_id")
 	if deviceID == "" {
 		http.Error(w, "device_id is required", http.StatusBadRequest)
@@ -29,9 +53,14 @@ func GetNextItem(w http.ResponseWriter, r *http.Request) {
 
 	var device models.Device
 	if err := db.Where("device_id = ?", deviceID).First(&device).Error; err != nil {
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			http.Error(w, "Failed to load device", http.StatusInternalServerError)
+			return
+		}
+
 		device = models.Device{
 			DeviceID:  deviceID,
-			CreatedAt: time.Now(),
+			CreatedAt: h.now(),
 		}
 		if err := db.Create(&device).Error; err != nil {
 			http.Error(w, "Failed to register device", http.StatusInternalServerError)
@@ -40,26 +69,20 @@ func GetNextItem(w http.ResponseWriter, r *http.Request) {
 		metrics.DeviceRegisteredTotal.Add(1)
 	}
 
-	var item models.Item
-	var feed models.Feed
-
-	if device.CurrentItemID != nil {
-		if err := db.Where("id > ?", *device.CurrentItemID).Order("id ASC").First(&item).Error; err != nil {
-			if err := db.Order("id ASC").First(&item).Error; err != nil {
-				http.Error(w, "No items available", http.StatusNotFound)
-				return
-			}
-		}
-	} else {
-		if err := db.Order("id ASC").First(&item).Error; err != nil {
-			http.Error(w, "No items available", http.StatusNotFound)
-			return
-		}
+	item, err := h.selector.SelectNext(r.Context(), db, device)
+	if err != nil {
+		http.Error(w, "Failed to select next item", http.StatusInternalServerError)
+		return
 	}
 
-	if err := db.First(&feed, item.FeedID).Error; err != nil {
-		http.Error(w, "Feed not found", http.StatusInternalServerError)
-		return
+	feedName := "System"
+	if item.FeedID != 0 {
+		var feed models.Feed
+		if err := db.First(&feed, item.FeedID).Error; err != nil {
+			http.Error(w, "Feed not found", http.StatusInternalServerError)
+			return
+		}
+		feedName = feed.Name
 	}
 
 	imageURL := ""
@@ -69,14 +92,19 @@ func GetNextItem(w http.ResponseWriter, r *http.Request) {
 	}
 	imageURL = fmt.Sprintf("%s://%s/image/%d.jpg", scheme, r.Host, item.ID)
 
-	device.CurrentItemID = &item.ID
-	device.LastSeen = time.Now()
-	db.Save(&device)
+	if item.ID != PlaceholderItemID {
+		device.CurrentItemID = &item.ID
+	}
+	device.LastSeen = h.now()
+	if err := db.Save(&device).Error; err != nil {
+		http.Error(w, "Failed to update device state", http.StatusInternalServerError)
+		return
+	}
 
 	resp := NextItemResponse{
 		Title:    item.Title,
 		ImageURL: imageURL,
-		Source:   feed.Name,
+		Source:   feedName,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

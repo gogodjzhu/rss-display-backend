@@ -10,11 +10,34 @@ rss:
   fetch_interval_minutes: 15
   image_width: 320
   image_height: 240
+  image_download_timeout_seconds: 3
+  feed_fetch_timeout_seconds: 10
 
 feeds:
   - name: HackerNews
     url: https://news.ycombinator.com/rss
-    enabled: false
+    enabled: true
   - name: BBC Business
     url: https://feeds.bbci.co.uk/news/business/rss.xml
+    enabled: true
+  - name: 少数派
+    url: https://sspai.com/feed
+    enabled: true
+  - name: InfoQ 推荐
+    url: https://plink.anyfeeder.com/infoq/recommend
+    enabled: true
+  - name: 36氪
+    url: https://www.36kr.com/feed
+    enabled: true
+  - name: Yahoo MostViewed
+    url: https://news.yahoo.com/rss/mostviewed
+    enabled: true
+  - name: V2EX
+    url: https://v2ex.com/index.xml
+    enabled: true
+  - name: 爱范儿
+    url: https://www.ifanr.com/feed
+    enabled: true
+  - name: 架构师之路
+    url: https://plink.anyfeeder.com/weixin/gh_10a6b96351a9
     enabled: true

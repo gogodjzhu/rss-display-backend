@@ -77,8 +77,11 @@ func runServer(cmd *cobra.Command, args []string) {
 
 func initFeeds(feeds []config.FeedConfig) {
 	db := database.GetDB()
+	configuredURLs := make(map[string]struct{}, len(feeds))
 
 	for _, f := range feeds {
+		configuredURLs[f.URL] = struct{}{}
+
 		var existing models.Feed
 		if err := db.Where("url = ?", f.URL).First(&existing).Error; err != nil {
 			db.Create(&models.Feed{
@@ -89,5 +92,27 @@ func initFeeds(feeds []config.FeedConfig) {
 		} else {
 			db.Model(&existing).Updates(models.Feed{Name: f.Name, Enabled: f.Enabled})
 		}
+	}
+
+	var existingFeeds []models.Feed
+	if err := db.Find(&existingFeeds).Error; err != nil {
+		log.Printf("Failed to list existing feeds: %v", err)
+		return
+	}
+
+	for _, feed := range existingFeeds {
+		if _, ok := configuredURLs[feed.URL]; ok {
+			continue
+		}
+		if !feed.Enabled {
+			continue
+		}
+
+		if err := db.Model(&feed).Update("enabled", false).Error; err != nil {
+			log.Printf("Failed to disable stale feed %q (%s): %v", feed.Name, feed.URL, err)
+			continue
+		}
+
+		log.Printf("Disabled stale feed %q (%s) not present in config", feed.Name, feed.URL)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"sync/atomic"
 	"strings"
 	"time"
 
@@ -18,18 +19,27 @@ import (
 
 type Worker struct {
 	fetchInterval time.Duration
+	httpClient    *http.Client
 	stopCh        chan struct{}
+	refreshing    atomic.Bool
 }
 
 func New(cfg *config.RSSConfig) *Worker {
+	feedTimeout := time.Duration(cfg.FeedFetchTimeoutSeconds) * time.Second
+	if feedTimeout <= 0 {
+		feedTimeout = 10 * time.Second
+	}
+
 	return &Worker{
 		fetchInterval: time.Duration(cfg.FetchIntervalMinutes) * time.Minute,
+		httpClient:    &http.Client{Timeout: feedTimeout},
 		stopCh:        make(chan struct{}),
 	}
 }
 
 func (w *Worker) Start() {
-	w.fetchAllFeeds()
+	log.Printf("[rss] worker started: interval=%s timeout=%s", w.fetchInterval, w.httpClient.Timeout)
+	go w.fetchAllFeeds()
 	go w.loop()
 }
 
@@ -52,32 +62,47 @@ func (w *Worker) loop() {
 }
 
 func (w *Worker) fetchAllFeeds() {
+	if !w.refreshing.CompareAndSwap(false, true) {
+		log.Printf("[rss] refresh skipped: previous refresh still running")
+		return
+	}
+	defer w.refreshing.Store(false)
+
 	db := database.GetDB()
 	var feeds []models.Feed
 
 	if err := db.Where("enabled = ?", true).Find(&feeds).Error; err != nil {
-		log.Printf("Error fetching feeds: %v", err)
+		log.Printf("[rss] failed to load enabled feeds: %v", err)
 		metrics.RSSFetchError.Add(1)
 		return
 	}
 
+	startedAt := time.Now()
+	log.Printf("[rss] refreshing %d enabled feeds", len(feeds))
+
 	for _, feed := range feeds {
 		w.fetchFeed(feed)
 	}
+
+	log.Printf("[rss] refresh finished in %s", time.Since(startedAt).Round(time.Millisecond))
 }
 
 func (w *Worker) fetchFeed(feed models.Feed) {
 	metrics.RSSFetchTotal.Add(1)
+	startedAt := time.Now()
+	log.Printf("[rss] fetching feed %q", feed.Name)
 
 	parser := gofeed.NewParser()
+	parser.Client = w.httpClient
 	parsed, err := parser.ParseURL(feed.URL)
 	if err != nil {
-		log.Printf("Error parsing feed %s: %v", feed.Name, err)
+		log.Printf("[rss] fetch failed for %q: %v", feed.Name, err)
 		metrics.RSSFetchError.Add(1)
 		return
 	}
 
 	db := database.GetDB()
+	newItems := 0
 
 	for _, item := range parsed.Items {
 		title := item.Title
@@ -109,12 +134,15 @@ func (w *Worker) fetchFeed(feed models.Feed) {
 		}
 
 		if err := db.Create(&newItem).Error; err != nil {
-			log.Printf("Error saving item: %v", err)
+			log.Printf("[rss] failed to save item %q: %v", title, err)
 			continue
 		}
 
 		metrics.RSSItemsParsedTotal.Add(1)
+		newItems++
 	}
+
+	log.Printf("[rss] feed %q refreshed: %d items fetched, %d new, took %s", feed.Name, len(parsed.Items), newItems, time.Since(startedAt).Round(time.Millisecond))
 }
 func (w *Worker) extractImage(item *gofeed.Item) string {
 	if item == nil {

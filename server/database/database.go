@@ -23,7 +23,7 @@ func Init(cfg *config.DatabaseConfig) error {
 	switch cfg.Driver {
 	case "mysql":
 		db, err = gorm.Open(mysql.Open(cfg.DSN), &gorm.Config{
-			Logger: logger.Default.LogMode(logger.Info),
+			Logger: logger.Default.LogMode(logger.Silent),
 		})
 	case "sqlite":
 		fallthrough
@@ -32,7 +32,7 @@ func Init(cfg *config.DatabaseConfig) error {
 			return fmt.Errorf("failed to create database directory: %w", err)
 		}
 		db, err = gorm.Open(sqlite.Open(cfg.DSN), &gorm.Config{
-			Logger: logger.Default.LogMode(logger.Info),
+			Logger: logger.Default.LogMode(logger.Silent),
 		})
 	}
 
