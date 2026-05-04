@@ -2,6 +2,7 @@ package rssworker
 
 import (
 	"bytes"
+	_ "embed"
 	"fmt"
 	"hash/fnv"
 	"image"
@@ -24,11 +25,13 @@ import (
 	"github.com/mmcdole/gofeed"
 	xdraw "golang.org/x/image/draw"
 	"golang.org/x/image/font"
-	"golang.org/x/image/font/gofont/goregular"
 	"golang.org/x/image/font/opentype"
 	"golang.org/x/image/math/fixed"
 	"golang.org/x/net/html"
 )
+
+//go:embed fonts/wqy-microhei.ttf
+var wqyMicroHeiTTF []byte
 
 // colorPalette is a fixed set of dark background colors used when an RSS item
 // has no image. All RGB components are ≤ 120 to ensure white text stays legible.
@@ -59,12 +62,12 @@ type Worker struct {
 	cardTimeFace font.Face
 }
 
-// newGoRegularFace parses Go Regular and returns a font.Face at sizePt points
-// (72 DPI). Panics only if the embedded font binary is corrupt.
-func newGoRegularFace(sizePt float64) font.Face {
-	tt, err := opentype.Parse(goregular.TTF)
+// newWQYFace parses the embedded WenQuanYi Micro Hei TTF and returns a
+// font.Face at sizePt points (72 DPI). Supports CJK + Latin.
+func newWQYFace(sizePt float64) font.Face {
+	tt, err := opentype.Parse(wqyMicroHeiTTF)
 	if err != nil {
-		panic("rssworker: failed to parse embedded Go Regular font: " + err.Error())
+		panic("rssworker: failed to parse embedded WQY font: " + err.Error())
 	}
 	face, err := opentype.NewFace(tt, &opentype.FaceOptions{Size: sizePt, DPI: 72})
 	if err != nil {
@@ -81,11 +84,11 @@ func New(cfg *config.RSSConfig, imageDir string) *Worker {
 		imageDir:      imageDir,
 		stopCh:        make(chan struct{}),
 		// 13 pt: 4 rows (3 title + 1 time) fill imgHeight/3 comfortably.
-		barFace: newGoRegularFace(13),
+		barFace: newWQYFace(13),
 		// 18 pt: large, readable title for full-canvas color cards.
-		cardFace: newGoRegularFace(18),
+		cardFace: newWQYFace(18),
 		// 11 pt: compact timestamp at the bottom of color cards.
-		cardTimeFace: newGoRegularFace(11),
+		cardTimeFace: newWQYFace(11),
 	}
 }
 
