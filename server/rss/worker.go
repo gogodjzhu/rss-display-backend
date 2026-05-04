@@ -263,7 +263,7 @@ func parseIntAttr(s string) int {
 }
 
 func (w *Worker) extractFromEnclosures(item *gofeed.Item) string {
-	if item.Enclosures == nil || len(item.Enclosures) == 0 {
+	if len(item.Enclosures) == 0 {
 		return ""
 	}
 
