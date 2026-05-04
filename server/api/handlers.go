@@ -63,13 +63,11 @@ func GetNextItem(w http.ResponseWriter, r *http.Request) {
 	}
 
 	imageURL := ""
-	if item.ImagePath != "" {
-		scheme := "http"
-		if r.TLS != nil {
-			scheme = "https"
-		}
-		imageURL = fmt.Sprintf("%s://%s/image/%d.jpg", scheme, r.Host, item.ID)
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
 	}
+	imageURL = fmt.Sprintf("%s://%s/image/%d.jpg", scheme, r.Host, item.ID)
 
 	device.CurrentItemID = &item.ID
 	device.LastSeen = time.Now()

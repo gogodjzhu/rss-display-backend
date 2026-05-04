@@ -20,7 +20,6 @@ import (
 
 var (
 	configPath string
-	imageDir   string
 )
 
 var rootCmd = &cobra.Command{
@@ -29,7 +28,6 @@ var rootCmd = &cobra.Command{
 
 func init() {
 	rootCmd.Flags().StringVar(&configPath, "config", "config.yaml", "Path to config file")
-	rootCmd.Flags().StringVar(&imageDir, "image-dir", "/data/images", "Path to image directory")
 }
 
 func main() {
@@ -44,10 +42,6 @@ func runServer(cmd *cobra.Command, args []string) {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	if err := os.MkdirAll(imageDir, 0755); err != nil {
-		log.Fatalf("Failed to create image directory: %v", err)
-	}
-
 	if err := database.Init(&cfg.Database); err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
@@ -58,13 +52,13 @@ func runServer(cmd *cobra.Command, args []string) {
 
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("GET /v1/device/{device_id}/next", api.GetNextItem)
-	image.Mount(mux)
+	image.Mount(mux, &cfg.RSS)
 	mux.HandleFunc("GET /nfc/{device_id}", api.NFCRedirect)
 
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 	log.Printf("Starting server on %s", addr)
 
-	worker := rssworker.New(&cfg.RSS, imageDir)
+	worker := rssworker.New(&cfg.RSS)
 	worker.Start()
 
 	go func() {

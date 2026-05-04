@@ -30,4 +30,19 @@ var (
 		Name: "device_registered_total",
 		Help: "Total number of registered devices",
 	})
+
+	ImageRenderTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "image_render_total",
+		Help: "Total number of item image render requests",
+	})
+
+	ImageDownloadFailureTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "image_download_failure_total",
+		Help: "Total number of upstream image download or decode failures",
+	})
+
+	ImageColorCardTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "image_color_card_total",
+		Help: "Total number of generated color-card image responses",
+	})
 )

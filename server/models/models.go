@@ -32,7 +32,7 @@ type Item struct {
 	FeedID      uint       `gorm:"column:feed_id" json:"feed_id"`
 	Title       string     `gorm:"column:title" json:"title"`
 	URL         string     `gorm:"column:url" json:"url"`
-	ImagePath   string     `gorm:"column:image_path" json:"image_path"`
+	ImageURL    string     `gorm:"column:image_url" json:"image_url"`
 	PublishedAt *time.Time `gorm:"column:published_at" json:"published_at"`
 	CreatedAt   time.Time  `gorm:"column:created_at" json:"created_at"`
 }
