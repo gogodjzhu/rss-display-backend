@@ -3,7 +3,9 @@ package rssworker
 import (
 	"bytes"
 	"fmt"
+	"hash/fnv"
 	"image"
+	"image/color"
 	"image/jpeg"
 	_ "image/png"
 	"io"
@@ -20,9 +22,28 @@ import (
 	"github.com/esp32-rss-display/backend/server/metrics"
 	"github.com/esp32-rss-display/backend/server/models"
 	"github.com/mmcdole/gofeed"
-	"golang.org/x/image/draw"
+	xdraw "golang.org/x/image/draw"
+	"golang.org/x/image/font"
+	"golang.org/x/image/font/gofont/goregular"
+	"golang.org/x/image/font/opentype"
+	"golang.org/x/image/math/fixed"
 	"golang.org/x/net/html"
 )
+
+// colorPalette is a fixed set of dark background colors used when an RSS item
+// has no image. All RGB components are ≤ 120 to ensure white text stays legible.
+var colorPalette = []color.RGBA{
+	{R: 31, G: 47, B: 84, A: 255},  // dark navy
+	{R: 60, G: 32, B: 80, A: 255},  // dark purple
+	{R: 15, G: 70, B: 60, A: 255},  // dark teal
+	{R: 80, G: 30, B: 30, A: 255},  // dark crimson
+	{R: 55, G: 55, B: 20, A: 255},  // dark olive
+	{R: 20, G: 50, B: 80, A: 255},  // dark steel
+	{R: 70, G: 40, B: 15, A: 255},  // dark amber
+	{R: 30, G: 70, B: 30, A: 255},  // dark forest
+	{R: 80, G: 20, B: 60, A: 255},  // dark magenta
+	{R: 40, G: 40, B: 80, A: 255},  // dark indigo
+}
 
 type Worker struct {
 	fetchInterval time.Duration
@@ -30,6 +51,26 @@ type Worker struct {
 	imageHeight   int
 	imageDir      string
 	stopCh        chan struct{}
+	// barFace is used for the 33%-height overlay bar on real images (13 pt).
+	barFace font.Face
+	// cardFace is used for the title on full-canvas color-card images (18 pt).
+	cardFace font.Face
+	// cardTimeFace is used for the timestamp on full-canvas color-card images (11 pt).
+	cardTimeFace font.Face
+}
+
+// newGoRegularFace parses Go Regular and returns a font.Face at sizePt points
+// (72 DPI). Panics only if the embedded font binary is corrupt.
+func newGoRegularFace(sizePt float64) font.Face {
+	tt, err := opentype.Parse(goregular.TTF)
+	if err != nil {
+		panic("rssworker: failed to parse embedded Go Regular font: " + err.Error())
+	}
+	face, err := opentype.NewFace(tt, &opentype.FaceOptions{Size: sizePt, DPI: 72})
+	if err != nil {
+		panic("rssworker: failed to create font face: " + err.Error())
+	}
+	return face
 }
 
 func New(cfg *config.RSSConfig, imageDir string) *Worker {
@@ -39,6 +80,12 @@ func New(cfg *config.RSSConfig, imageDir string) *Worker {
 		imageHeight:   cfg.ImageHeight,
 		imageDir:      imageDir,
 		stopCh:        make(chan struct{}),
+		// 13 pt: 4 rows (3 title + 1 time) fill imgHeight/3 comfortably.
+		barFace: newGoRegularFace(13),
+		// 18 pt: large, readable title for full-canvas color cards.
+		cardFace: newGoRegularFace(18),
+		// 11 pt: compact timestamp at the bottom of color cards.
+		cardTimeFace: newGoRegularFace(11),
 	}
 }
 
@@ -66,34 +113,84 @@ func (w *Worker) loop() {
 	}
 }
 
-// backfillImages re-downloads images for items whose image_path is a remote URL
-// (i.e. was never downloaded to a local file). This handles rows created by an
-// older version of the code that skipped the download step.
+// backfillImages repairs items that are missing a usable local image file:
+//
+//   - Items whose image_path is a remote URL (created by an older code version):
+//     re-download and save locally without text overlay.
+//   - Items whose image_path is empty or points to a non-existent file
+//     (created when no image was found, or file was deleted):
+//     generate a color card with title+time overlay and save locally.
 func (w *Worker) backfillImages() {
 	db := database.GetDB()
-	var items []models.Item
-	if err := db.Where("image_path LIKE 'http://%' OR image_path LIKE 'https://%'").Find(&items).Error; err != nil {
-		log.Printf("[backfill] error querying items: %v", err)
+
+	// --- Pass 1: remote URLs → download and save locally (no overlay) ---
+	var remoteItems []models.Item
+	if err := db.Where("image_path LIKE 'http://%' OR image_path LIKE 'https://%'").Find(&remoteItems).Error; err != nil {
+		log.Printf("[backfill] error querying remote-URL items: %v", err)
+	} else if len(remoteItems) > 0 {
+		log.Printf("[backfill] re-downloading images for %d items", len(remoteItems))
+		for _, item := range remoteItems {
+			pubDate := item.CreatedAt
+			if item.PublishedAt != nil {
+				pubDate = *item.PublishedAt
+			}
+			src, err := w.downloadImage(item.ImagePath)
+			if err != nil {
+				log.Printf("[backfill] failed to download image for item %d: %s", item.ID, item.ImagePath)
+				continue
+			}
+			resized := w.resizeImage(src, w.imageWidth, w.imageHeight)
+			localPath := w.saveImage(resized, w.imageDir, pubDate)
+			if localPath == "" {
+				log.Printf("[backfill] failed to save image for item %d", item.ID)
+				continue
+			}
+			if err := db.Model(&item).Update("image_path", localPath).Error; err != nil {
+				log.Printf("[backfill] failed to update item %d: %v", item.ID, err)
+			} else {
+				log.Printf("[backfill] item %d image saved to %s", item.ID, localPath)
+			}
+		}
+	}
+
+	// --- Pass 2: empty or missing local paths → color card + overlay ---
+	var allItems []models.Item
+	if err := db.Where("image_path = '' OR image_path IS NULL").Find(&allItems).Error; err != nil {
+		log.Printf("[backfill] error querying empty-path items: %v", err)
 		return
 	}
-	if len(items) == 0 {
+	// Also check items whose image_path points to a file that no longer exists.
+	var localItems []models.Item
+	if err := db.Where("image_path != '' AND image_path NOT LIKE 'http://%' AND image_path NOT LIKE 'https://%'").Find(&localItems).Error; err != nil {
+		log.Printf("[backfill] error querying local-path items: %v", err)
+	} else {
+		for _, item := range localItems {
+			if _, err := os.Stat(item.ImagePath); os.IsNotExist(err) {
+				allItems = append(allItems, item)
+			}
+		}
+	}
+
+	if len(allItems) == 0 {
 		return
 	}
-	log.Printf("[backfill] re-downloading images for %d items", len(items))
-	for _, item := range items {
+	log.Printf("[backfill] generating color-card images for %d items", len(allItems))
+	for _, item := range allItems {
 		pubDate := item.CreatedAt
 		if item.PublishedAt != nil {
 			pubDate = *item.PublishedAt
 		}
-		localPath := w.downloadAndResizeImage(item.ImagePath, pubDate)
+		canvas := w.generateColorCard(item.Title, w.imageWidth, w.imageHeight)
+		w.overlayTextFull(canvas, item.Title, pubDate)
+		localPath := w.saveImage(canvas, w.imageDir, pubDate)
 		if localPath == "" {
-			log.Printf("[backfill] failed to download image for item %d: %s", item.ID, item.ImagePath)
+			log.Printf("[backfill] failed to save color card for item %d", item.ID)
 			continue
 		}
 		if err := db.Model(&item).Update("image_path", localPath).Error; err != nil {
 			log.Printf("[backfill] failed to update item %d: %v", item.ID, err)
 		} else {
-			log.Printf("[backfill] item %d image saved to %s", item.ID, localPath)
+			log.Printf("[backfill] item %d color card saved to %s", item.ID, localPath)
 		}
 	}
 }
@@ -139,8 +236,6 @@ func (w *Worker) fetchFeed(feed models.Feed) {
 			continue
 		}
 
-		imageURL := w.extractImage(item)
-
 		var publishedAt *time.Time
 		if item.PublishedParsed != nil {
 			t := *item.PublishedParsed
@@ -151,7 +246,30 @@ func (w *Worker) fetchFeed(feed models.Feed) {
 		if publishedAt != nil {
 			pubDate = *publishedAt
 		}
-		imagePath := w.downloadAndResizeImage(imageURL, pubDate)
+
+		// Build the processed image: either downloaded+resized or a color card.
+		// The overlay style depends on whether a real photo was obtained.
+		var canvas *image.RGBA
+		hasImage := false
+
+		imageURL := w.extractImage(item)
+		if imageURL != "" {
+			src, err := w.downloadImage(imageURL)
+			if err == nil {
+				canvas = w.resizeImage(src, w.imageWidth, w.imageHeight)
+				hasImage = true
+			} else {
+				log.Printf("[image] download failed for %s, falling back to color card: %v", url, err)
+			}
+		}
+
+		if !hasImage {
+			canvas = w.generateColorCard(title, w.imageWidth, w.imageHeight)
+			w.overlayTextFull(canvas, title, pubDate)
+		} else {
+			w.overlayText(canvas, title, pubDate)
+		}
+		imagePath := w.saveImage(canvas, w.imageDir, pubDate)
 
 		newItem := models.Item{
 			FeedID:      feed.ID,
@@ -170,54 +288,265 @@ func (w *Worker) fetchFeed(feed models.Feed) {
 	}
 }
 
-// downloadAndResizeImage downloads the image at url, resizes it to the
-// configured dimensions, and saves it under a YYYYMMDD sub-directory derived
-// from date. Returns the full filesystem path on success, or "" on failure.
-func (w *Worker) downloadAndResizeImage(url string, date time.Time) string {
-	if url == "" {
-		return ""
-	}
-
+// downloadImage fetches the image at url and decodes it. Returns an error if
+// the request fails, the status is not 200, or the format is unsupported.
+func (w *Worker) downloadImage(url string) (image.Image, error) {
 	resp, err := http.Get(url)
 	if err != nil {
-		return ""
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return ""
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
 	img, format, err := image.Decode(resp.Body)
 	if err != nil {
-		return ""
+		return nil, err
 	}
-
 	if format != "jpeg" && format != "png" {
-		return ""
+		return nil, fmt.Errorf("unsupported image format: %s", format)
 	}
+	return img, nil
+}
 
-	resized := image.NewRGBA(image.Rect(0, 0, w.imageWidth, w.imageHeight))
-	draw.NearestNeighbor.Scale(resized, resized.Bounds(), img, img.Bounds(), draw.Over, nil)
+// resizeImage scales src to width×height using nearest-neighbour interpolation.
+func (w *Worker) resizeImage(src image.Image, width, height int) *image.RGBA {
+	dst := image.NewRGBA(image.Rect(0, 0, width, height))
+	xdraw.NearestNeighbor.Scale(dst, dst.Bounds(), src, src.Bounds(), xdraw.Over, nil)
+	return dst
+}
 
+// saveImage encodes img as JPEG (quality 80) and writes it under
+// <dir>/YYYYMMDD/<nanosecond>.jpg. Returns the full path on success or "".
+func (w *Worker) saveImage(img *image.RGBA, dir string, date time.Time) string {
 	var buf bytes.Buffer
-	encoder := jpeg.Options{Quality: 80}
-	if err := jpeg.Encode(&buf, resized, &encoder); err != nil {
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 80}); err != nil {
 		return ""
 	}
 
-	dateDir := filepath.Join(w.imageDir, date.UTC().Format("20060102"))
+	dateDir := filepath.Join(dir, date.UTC().Format("20060102"))
 	if err := os.MkdirAll(dateDir, 0755); err != nil {
 		return ""
 	}
 
-	id := fmt.Sprintf("%d", time.Now().UnixNano())
-	filename := filepath.Join(dateDir, id+".jpg")
+	filename := filepath.Join(dateDir, fmt.Sprintf("%d.jpg", time.Now().UnixNano()))
 	if err := os.WriteFile(filename, buf.Bytes(), 0644); err != nil {
 		return ""
 	}
-
 	return filename
+}
+
+// generateColorCard creates a width×height solid-color image whose colour is
+// determined deterministically by the FNV-32a hash of title mod the palette.
+func (w *Worker) generateColorCard(title string, width, height int) *image.RGBA {
+	h := fnv.New32a()
+	h.Write([]byte(title))
+	c := colorPalette[int(h.Sum32())%len(colorPalette)]
+
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			img.SetRGBA(x, y, c)
+		}
+	}
+	return img
+}
+
+// wrapText splits text into at most maxLines lines that each fit within
+// maxWidth pixels as measured by face. It prefers to break at spaces; if no
+// suitable space is found it hard-breaks using binary search. The last allowed
+// line is truncated with "..." if the text still overflows.
+func wrapText(face font.Face, text string, maxWidth, maxLines int) []string {
+
+	d := &font.Drawer{Face: face}
+	fits := func(s string) bool { return d.MeasureString(s).Round() <= maxWidth }
+
+	// fitRunes returns the largest prefix of runes whose rendering (plus
+	// optional suffix) fits within maxWidth.
+	fitRunes := func(runes []rune, suffix string) int {
+		lo, hi := 0, len(runes)
+		for lo < hi {
+			mid := (lo+hi+1)/2
+			if fits(string(runes[:mid]) + suffix) {
+				lo = mid
+			} else {
+				hi = mid - 1
+			}
+		}
+		return lo
+	}
+
+	runes := []rune(text)
+	var lines []string
+
+	for len(runes) > 0 {
+		full := string(runes)
+		if fits(full) {
+			lines = append(lines, full)
+			break
+		}
+
+		if len(lines) == maxLines-1 {
+			// Last line: truncate to fit with "...".
+			n := fitRunes(runes, "...")
+			lines = append(lines, string(runes[:n])+"...")
+			break
+		}
+
+		// Find the last space at which the prefix fits.
+		breakAt := -1
+		for i := len(runes) - 1; i > 0; i-- {
+			if runes[i] == ' ' && fits(string(runes[:i])) {
+				breakAt = i
+				break
+			}
+		}
+		if breakAt == -1 {
+			// No usable space — hard-break at the character boundary.
+			breakAt = fitRunes(runes, "")
+			if breakAt == 0 {
+				breakAt = 1
+			}
+		}
+
+		lines = append(lines, string(runes[:breakAt]))
+		runes = runes[breakAt:]
+		for len(runes) > 0 && runes[0] == ' ' {
+			runes = runes[1:]
+		}
+	}
+
+	return lines
+}
+
+// overlayText draws a semi-transparent black bar at the bottom of img
+// (≤ imgHeight/3) and renders the title (up to 3 wrapped lines) plus pubTime
+// in white. Used when a real photo is present as the background.
+func (w *Worker) overlayText(img *image.RGBA, title string, pubTime time.Time) {
+	const (
+		margin   = 8   // left/right pixel margin for text
+		padTop   = 8   // padding above the first text line inside the bar
+		barAlpha = 160 // semi-transparent black overlay (≈63%)
+		maxRows  = 4   // max title rows (3) + time row (1)
+	)
+
+	imgW := img.Bounds().Max.X
+	imgH := img.Bounds().Max.Y
+	maxBarHeight := imgH / 3
+
+	// Compute a line height that makes maxRows fill exactly maxBarHeight.
+	lineHeight := (maxBarHeight - padTop) / maxRows
+
+	face := w.barFace
+	ascent := face.Metrics().Ascent.Round()
+	maxTextWidth := imgW - 2*margin
+
+	titleLines := wrapText(face, title, maxTextWidth, 3)
+	timeStr := pubTime.UTC().Format("2006-01-02 15:04")
+
+	totalRows := len(titleLines) + 1 // title lines + 1 time row
+	barHeight := totalRows*lineHeight + padTop
+	if barHeight > maxBarHeight {
+		barHeight = maxBarHeight
+	}
+	barY := imgH - barHeight
+
+	// Blend a semi-transparent black rectangle over the bar region.
+	for y := barY; y < imgH; y++ {
+		for x := 0; x < imgW; x++ {
+			orig := img.RGBAAt(x, y)
+			img.SetRGBA(x, y, color.RGBA{
+				R: uint8((int(orig.R) * (255 - barAlpha)) / 255),
+				G: uint8((int(orig.G) * (255 - barAlpha)) / 255),
+				B: uint8((int(orig.B) * (255 - barAlpha)) / 255),
+				A: 255,
+			})
+		}
+	}
+
+	white := image.NewUniform(color.RGBA{R: 255, G: 255, B: 255, A: 255})
+
+	drawRow := func(row int, text string) {
+		baseline := barY + padTop + row*lineHeight + ascent
+		d := &font.Drawer{
+			Dst:  img,
+			Src:  white,
+			Face: face,
+			Dot:  fixed.Point26_6{X: fixed.I(margin), Y: fixed.I(baseline)},
+		}
+		d.DrawString(text)
+	}
+
+	for i, line := range titleLines {
+		drawRow(i, line)
+	}
+	drawRow(len(titleLines), timeStr)
+}
+
+// overlayTextFull renders the title and timestamp across the entire canvas.
+// Used for color-card images (no background photo) so the full height is
+// available for text. Title lines are centered horizontally and as a block
+// vertically; the timestamp sits at the bottom in a smaller font.
+func (w *Worker) overlayTextFull(img *image.RGBA, title string, pubTime time.Time) {
+	const (
+		margin      = 16  // left/right margin for text
+		bottomPad   = 12  // pixels below the timestamp baseline
+		maxTitleLines = 5 // allow more lines since the whole canvas is free
+	)
+
+	imgW := img.Bounds().Max.X
+	imgH := img.Bounds().Max.Y
+
+	cardMetrics := w.cardFace.Metrics()
+	timeMetrics := w.cardTimeFace.Metrics()
+
+	// Reserve space at the bottom for the timestamp.
+	timeSectionH := timeMetrics.Height.Round() + bottomPad + 8 // 8 px gap above
+	titleAreaH := imgH - timeSectionH
+
+	// Line height for title: use the face's own height metric plus a small gap.
+	cardLineH := cardMetrics.Height.Round() + 3
+
+	maxWidth := imgW - 2*margin
+	titleLines := wrapText(w.cardFace, title, maxWidth, maxTitleLines)
+
+	// Vertically center the title block inside titleAreaH.
+	totalTitleH := len(titleLines) * cardLineH
+	titleBlockStartY := (titleAreaH - totalTitleH) / 2
+	if titleBlockStartY < 8 {
+		titleBlockStartY = 8
+	}
+
+	white := image.NewUniform(color.RGBA{R: 255, G: 255, B: 255, A: 255})
+	d := &font.Drawer{Dst: img, Src: white}
+
+	// Draw each title line centered horizontally.
+	d.Face = w.cardFace
+	for i, line := range titleLines {
+		baseline := titleBlockStartY + i*cardLineH + cardMetrics.Ascent.Round()
+		lineW := d.MeasureString(line).Round()
+		startX := (imgW - lineW) / 2
+		if startX < margin {
+			startX = margin
+		}
+		d.Dot = fixed.Point26_6{X: fixed.I(startX), Y: fixed.I(baseline)}
+		d.DrawString(line)
+	}
+
+	// Draw the timestamp centered at the bottom.
+	timeStr := pubTime.UTC().Format("2006-01-02 15:04")
+	d.Face = w.cardTimeFace
+	timeW := d.MeasureString(timeStr).Round()
+	timeX := (imgW - timeW) / 2
+	if timeX < margin {
+		timeX = margin
+	}
+	// Baseline: imgH - bottomPad - descent
+	timeBaseline := imgH - bottomPad - timeMetrics.Descent.Round()
+	d.Dot = fixed.Point26_6{X: fixed.I(timeX), Y: fixed.I(timeBaseline)}
+	d.DrawString(timeStr)
 }
 
 func (w *Worker) extractImage(item *gofeed.Item) string {
