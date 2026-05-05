@@ -52,6 +52,7 @@ func runServer(cmd *cobra.Command, args []string) {
 
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("GET /v1/device/{device_id}/next", api.GetNextItem)
+	mux.HandleFunc("POST /v1/item/{item_id}/rating", api.PostItemRating)
 	image.Mount(mux, &cfg.RSS)
 	mux.HandleFunc("GET /nfc/{device_id}", api.NFCRedirect)
 

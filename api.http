@@ -1,0 +1,17 @@
+###
+GET http://localhost:8080/v1/device/test-device-001/next
+
+###
+GET http://localhost:8080/nfc/test-device-001
+
+###
+POST http://localhost:8080/v1/item/203/rating
+Content-Type: application/json
+
+{
+  "rating": 4,
+  "device_id": "test-device-001"
+}
+
+###
+GET http://localhost:8080/metrics

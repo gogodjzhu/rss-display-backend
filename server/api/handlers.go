@@ -1,10 +1,12 @@
 package api
 
 import (
-	"errors"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/esp32-rss-display/backend/server/database"
@@ -14,9 +16,15 @@ import (
 )
 
 type NextItemResponse struct {
+	ItemID   uint   `json:"item_id"`
 	Title    string `json:"title"`
 	ImageURL string `json:"image_url"`
 	Source   string `json:"source"`
+}
+
+type ItemRatingRequest struct {
+	Rating   int    `json:"rating"`
+	DeviceID string `json:"device_id"`
 }
 
 type Handler struct {
@@ -102,6 +110,7 @@ func (h *Handler) GetNextItem(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := NextItemResponse{
+		ItemID:   item.ID,
 		Title:    item.Title,
 		ImageURL: imageURL,
 		Source:   feedName,
@@ -109,4 +118,50 @@ func (h *Handler) GetNextItem(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+func PostItemRating(w http.ResponseWriter, r *http.Request) {
+	itemID, err := strconv.ParseUint(r.PathValue("item_id"), 10, 64)
+	if err != nil {
+		http.Error(w, "invalid item_id", http.StatusBadRequest)
+		return
+	}
+	if itemID == uint64(PlaceholderItemID) {
+		http.Error(w, "placeholder items cannot be rated", http.StatusBadRequest)
+		return
+	}
+
+	var req ItemRatingRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Rating < 1 || req.Rating > 5 {
+		http.Error(w, "rating must be between 1 and 5", http.StatusBadRequest)
+		return
+	}
+
+	db := database.GetDB()
+	var item models.Item
+	if err := db.Select("id").First(&item, itemID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			http.Error(w, "item not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "failed to load item", http.StatusInternalServerError)
+		return
+	}
+
+	rating := models.ItemRating{
+		ItemID:   uint(itemID),
+		DeviceID: req.DeviceID,
+		Rating:   req.Rating,
+	}
+	if err := db.Create(&rating).Error; err != nil {
+		http.Error(w, "failed to save rating", http.StatusInternalServerError)
+		return
+	}
+	log.Printf("[rating] Updated rating for item %d from device %s: %d", itemID, req.DeviceID, req.Rating)
+
+	w.WriteHeader(http.StatusNoContent)
 }

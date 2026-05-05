@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -56,6 +58,9 @@ func TestGetNextItemRegistersDeviceAndUpdatesState(t *testing.T) {
 
 	if resp.Title != item.Title {
 		t.Fatalf("expected title %q, got %q", item.Title, resp.Title)
+	}
+	if resp.ItemID != item.ID {
+		t.Fatalf("expected item_id %d, got %d", item.ID, resp.ItemID)
 	}
 	if resp.Source != feed.Name {
 		t.Fatalf("expected source %q, got %q", feed.Name, resp.Source)
@@ -114,6 +119,9 @@ func TestGetNextItemReturnsPlaceholderWhenSelectorHasNoItems(t *testing.T) {
 	if resp.Title != PlaceholderTitle {
 		t.Fatalf("expected title %q, got %q", PlaceholderTitle, resp.Title)
 	}
+	if resp.ItemID != PlaceholderItemID {
+		t.Fatalf("expected item_id %d, got %d", PlaceholderItemID, resp.ItemID)
+	}
 	if resp.Source != "System" {
 		t.Fatalf("expected source %q, got %q", "System", resp.Source)
 	}
@@ -148,6 +156,84 @@ func TestGetNextItemReturnsServerErrorWhenSelectorFails(t *testing.T) {
 
 	if rr.Code != http.StatusInternalServerError {
 		t.Fatalf("expected 500, got %d", rr.Code)
+	}
+}
+
+func TestPostItemRatingPersistsRating(t *testing.T) {
+	db := newTestDB(t)
+	feed := createTestFeed(t, db, "feed-a", true)
+	item := createTestItem(t, db, feed.ID, "fresh", time.Now().UTC(), nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/item/"+uintToString(item.ID)+"/rating", strings.NewReader(`{"rating":5,"device_id":"esp32-1"}`))
+	req.SetPathValue("item_id", uintToString(item.ID))
+	rr := httptest.NewRecorder()
+
+	PostItemRating(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("expected 204, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var rating models.ItemRating
+	if err := db.First(&rating).Error; err != nil {
+		t.Fatalf("failed to load rating: %v", err)
+	}
+	if rating.ItemID != item.ID || rating.Rating != 5 || rating.DeviceID != "esp32-1" {
+		t.Fatalf("unexpected persisted rating: %+v", rating)
+	}
+}
+
+func TestPostItemRatingRejectsInvalidCases(t *testing.T) {
+	db := newTestDB(t)
+	feed := createTestFeed(t, db, "feed-a", true)
+	item := createTestItem(t, db, feed.ID, "fresh", time.Now().UTC(), nil)
+
+	tests := []struct {
+		name       string
+		itemID     string
+		body       string
+		wantStatus int
+	}{
+		{name: "placeholder", itemID: "0", body: `{"rating":3}`, wantStatus: http.StatusBadRequest},
+		{name: "missing item", itemID: "9999", body: `{"rating":3}`, wantStatus: http.StatusNotFound},
+		{name: "too low", itemID: uintToString(item.ID), body: `{"rating":0}`, wantStatus: http.StatusBadRequest},
+		{name: "too high", itemID: uintToString(item.ID), body: `{"rating":6}`, wantStatus: http.StatusBadRequest},
+		{name: "bad body", itemID: uintToString(item.ID), body: `{`, wantStatus: http.StatusBadRequest},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/item/"+tc.itemID+"/rating", strings.NewReader(tc.body))
+			req.SetPathValue("item_id", tc.itemID)
+			rr := httptest.NewRecorder()
+
+			PostItemRating(rr, req)
+
+			if rr.Code != tc.wantStatus {
+				t.Fatalf("expected %d, got %d: %s", tc.wantStatus, rr.Code, rr.Body.String())
+			}
+		})
+	}
+
+	var count int64
+	if err := db.Model(&models.ItemRating{}).Count(&count).Error; err != nil {
+		t.Fatalf("failed to count ratings: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected no persisted ratings for invalid requests, got %d", count)
+	}
+}
+
+func TestPostItemRatingRejectsInvalidItemID(t *testing.T) {
+	_ = newTestDB(t)
+	req := httptest.NewRequest(http.MethodPost, "/v1/item/bad/rating", io.NopCloser(strings.NewReader(`{"rating":3}`)))
+	req.SetPathValue("item_id", "bad")
+	rr := httptest.NewRecorder()
+
+	PostItemRating(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rr.Code)
 	}
 }
 
