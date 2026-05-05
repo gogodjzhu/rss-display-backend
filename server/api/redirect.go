@@ -38,5 +38,14 @@ func NFCRedirect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	read := models.ItemRead{
+		ItemID:   item.ID,
+		DeviceID: device.DeviceID,
+	}
+	if err := db.Create(&read).Error; err != nil {
+		http.Error(w, "Failed to record item read", http.StatusInternalServerError)
+		return
+	}
+
 	http.Redirect(w, r, item.URL, http.StatusFound)
 }

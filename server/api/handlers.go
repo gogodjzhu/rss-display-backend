@@ -108,6 +108,16 @@ func (h *Handler) GetNextItem(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to update device state", http.StatusInternalServerError)
 		return
 	}
+	if item.ID != PlaceholderItemID {
+		show := models.ItemShow{
+			ItemID:   item.ID,
+			DeviceID: device.DeviceID,
+		}
+		if err := db.Create(&show).Error; err != nil {
+			http.Error(w, "Failed to record item show", http.StatusInternalServerError)
+			return
+		}
+	}
 
 	resp := NextItemResponse{
 		ItemID:   item.ID,

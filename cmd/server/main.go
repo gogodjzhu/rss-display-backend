@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/esp32-rss-display/backend/server/admin"
 	"github.com/esp32-rss-display/backend/server/api"
 	"github.com/esp32-rss-display/backend/server/config"
 	"github.com/esp32-rss-display/backend/server/database"
@@ -51,6 +52,7 @@ func runServer(cmd *cobra.Command, args []string) {
 	mux := http.NewServeMux()
 
 	mux.Handle("/metrics", promhttp.Handler())
+	admin.Mount(mux)
 	mux.HandleFunc("GET /v1/device/{device_id}/next", api.GetNextItem)
 	mux.HandleFunc("POST /v1/item/{item_id}/rating", api.PostItemRating)
 	image.Mount(mux, &cfg.RSS)

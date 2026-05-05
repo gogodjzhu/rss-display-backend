@@ -109,7 +109,7 @@ func newTestDB(t *testing.T) *gorm.DB {
 		t.Fatalf("failed to open test db: %v", err)
 	}
 
-	if err := db.AutoMigrate(&models.Device{}, &models.Feed{}, &models.Item{}, &models.ItemRating{}); err != nil {
+	if err := db.AutoMigrate(&models.Device{}, &models.Feed{}, &models.Item{}, &models.ItemShow{}, &models.ItemRead{}, &models.ItemRating{}); err != nil {
 		t.Fatalf("failed to migrate test db: %v", err)
 	}
 
@@ -134,7 +134,7 @@ func createTestItem(t *testing.T, db *gorm.DB, feedID uint, title string, create
 	item := models.Item{
 		FeedID:      feedID,
 		Title:       title,
-		URL:         title + ".example.com",
+		URL:         "https://" + title + ".example.com",
 		ImageURL:    "https://example.com/" + title + ".jpg",
 		PublishedAt: publishedAt,
 		CreatedAt:   createdAt,

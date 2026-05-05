@@ -52,3 +52,25 @@ type ItemRating struct {
 func (ItemRating) TableName() string {
 	return "item_ratings"
 }
+
+type ItemRead struct {
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	ItemID    uint      `gorm:"column:item_id;index" json:"item_id"`
+	DeviceID  string    `gorm:"column:device_id;index" json:"device_id"`
+	CreatedAt time.Time `gorm:"column:created_at" json:"created_at"`
+}
+
+func (ItemRead) TableName() string {
+	return "item_reads"
+}
+
+type ItemShow struct {
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	ItemID    uint      `gorm:"column:item_id;index" json:"item_id"`
+	DeviceID  string    `gorm:"column:device_id;index" json:"device_id"`
+	CreatedAt time.Time `gorm:"column:created_at" json:"created_at"`
+}
+
+func (ItemShow) TableName() string {
+	return "item_shows"
+}
