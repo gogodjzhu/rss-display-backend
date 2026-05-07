@@ -16,14 +16,18 @@ if ! [ -x "$(command -v apt-get)" ]; then
 fi
 
 # Prepare package
+rm /etc/apt/sources.list.d/yarn.list
 apt-get update -y
 apt-get install -y curl wget iputils-ping net-tools vim
+
+# opencode
 curl -fsSL https://opencode.ai/install | bash
 npm install -g @fission-ai/openspec@latest
 
-# git config
+
+git config
 git config --global --add safe.directory '*'
 
-# set go env
+set go env
 go mod tidy
 go mod vendor
