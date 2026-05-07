@@ -14,36 +14,16 @@ nvm install --lts && nvm use --lts
 curl -fsSL https://pyenv.run | bash
 cat << 'EOF' >> ~/.bashrc
 ### pyenv
-# Load pyenv automatically by appending
-# the following to
-# ~/.bash_profile if it exists, otherwise ~/.profile (for login shells)
-# and ~/.bashrc (for interactive shells) :
-
 export PYENV_ROOT="$HOME/.pyenv"
 [[ -d $PYENV_ROOT/bin ]] && export PATH="$PYENV_ROOT/bin:$PATH"
 eval "$(pyenv init - bash)"
-
-# Restart your shell for the changes to take effect.
-
-# Load pyenv-virtualenv automatically by adding
-# the following to ~/.bashrc:
-
-eval "$(pyenv virtualenv-init -)"
 EOF
 source ~/.bashrc
-sudo apt update &&sudo apt install -y \
+apt-get update && apt-get install -y \
 build-essential \
-libssl-dev \
-zlib1g-dev \
-libbz2-dev \
-libreadline-dev \
+sqlite3 \
 libsqlite3-dev \
-libffi-dev \
-libncurses5-dev \
-libncursesw5-dev \
-liblzma-dev \
-tk-dev \
-xz-utils
+libffi-dev
 pyenv install 3.11.9 && pyenv global 3.11.9
 
 ## crawl4ai
