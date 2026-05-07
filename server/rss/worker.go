@@ -1,12 +1,14 @@
 package rssworker
 
 import (
+	"errors"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"regexp"
-	"sync/atomic"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/esp32-rss-display/backend/server/config"
@@ -15,6 +17,7 @@ import (
 	"github.com/esp32-rss-display/backend/server/models"
 	"github.com/mmcdole/gofeed"
 	"golang.org/x/net/html"
+	"gorm.io/gorm"
 )
 
 type Worker struct {
@@ -106,14 +109,17 @@ func (w *Worker) fetchFeed(feed models.Feed) {
 
 	for _, item := range parsed.Items {
 		title := item.Title
-		url := item.Link
+		itemURL := normalizeItemURL(item.Link)
 
-		if url == "" {
+		if itemURL == "" {
 			continue
 		}
 
 		var existingItem models.Item
-		if err := db.Where("feed_id = ? AND url = ?", feed.ID, url).First(&existingItem).Error; err == nil {
+		if err := db.Where("feed_id = ? AND url = ?", feed.ID, itemURL).First(&existingItem).Error; err == nil {
+			continue
+		} else if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			log.Printf("[rss] failed to check existing item %q: %v", title, err)
 			continue
 		}
 
@@ -128,12 +134,15 @@ func (w *Worker) fetchFeed(feed models.Feed) {
 		newItem := models.Item{
 			FeedID:      feed.ID,
 			Title:       title,
-			URL:         url,
+			URL:         itemURL,
 			ImageURL:    imageURL,
 			PublishedAt: publishedAt,
 		}
 
 		if err := db.Create(&newItem).Error; err != nil {
+			if isDuplicateItemError(err) {
+				continue
+			}
 			log.Printf("[rss] failed to save item %q: %v", title, err)
 			continue
 		}
@@ -144,6 +153,30 @@ func (w *Worker) fetchFeed(feed models.Feed) {
 
 	log.Printf("[rss] feed %q refreshed: %d items fetched, %d new, took %s", feed.Name, len(parsed.Items), newItems, time.Since(startedAt).Round(time.Millisecond))
 }
+
+func normalizeItemURL(raw string) string {
+	if raw == "" {
+		return ""
+	}
+
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+
+	parsed.Fragment = ""
+	return parsed.String()
+}
+
+func isDuplicateItemError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errText := strings.ToLower(err.Error())
+	return strings.Contains(errText, "unique constraint") || strings.Contains(errText, "duplicate entry")
+}
+
 func (w *Worker) extractImage(item *gofeed.Item) string {
 	if item == nil {
 		return ""

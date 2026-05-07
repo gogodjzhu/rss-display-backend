@@ -29,9 +29,9 @@ func (Feed) TableName() string {
 
 type Item struct {
 	ID          uint       `gorm:"primaryKey" json:"id"`
-	FeedID      uint       `gorm:"column:feed_id" json:"feed_id"`
+	FeedID      uint       `gorm:"column:feed_id;uniqueIndex:idx_items_feed_url" json:"feed_id"`
 	Title       string     `gorm:"column:title" json:"title"`
-	URL         string     `gorm:"column:url" json:"url"`
+	URL         string     `gorm:"column:url;uniqueIndex:idx_items_feed_url" json:"url"`
 	ImageURL    string     `gorm:"column:image_url" json:"image_url"`
 	PublishedAt *time.Time `gorm:"column:published_at" json:"published_at"`
 	CreatedAt   time.Time  `gorm:"column:created_at" json:"created_at"`
