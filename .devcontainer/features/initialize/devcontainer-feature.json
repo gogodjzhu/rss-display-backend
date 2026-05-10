@@ -1,6 +1,0 @@
-{
-  "id": "initialize",
-  "version": "1.0.0",
-  "name": "Initialize",
-  "description": "Install custom dependencies and perform setup tasks for the development container."
-}

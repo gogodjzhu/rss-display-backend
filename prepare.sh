@@ -29,3 +29,4 @@ pyenv install 3.11.9 && pyenv global 3.11.9
 ## crawl4ai
 pip install crawl4ai
 crawl4ai-setup && crawl4ai-doctor
+source ~/.bashrc
