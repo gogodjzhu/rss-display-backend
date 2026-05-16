@@ -3,7 +3,6 @@ package rssworker
 import (
 	"errors"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -13,12 +12,16 @@ import (
 
 	"github.com/esp32-rss-display/backend/server/config"
 	"github.com/esp32-rss-display/backend/server/database"
+	"github.com/esp32-rss-display/backend/server/logger"
 	"github.com/esp32-rss-display/backend/server/metrics"
 	"github.com/esp32-rss-display/backend/server/models"
 	"github.com/mmcdole/gofeed"
 	"golang.org/x/net/html"
 	"gorm.io/gorm"
 )
+
+var rssLog = logger.Get("rss")
+var imageLog = logger.Get("image")
 
 type Worker struct {
 	fetchInterval time.Duration
@@ -41,7 +44,7 @@ func New(cfg *config.RSSConfig) *Worker {
 }
 
 func (w *Worker) Start() {
-	log.Printf("[rss] worker started: interval=%s timeout=%s", w.fetchInterval, w.httpClient.Timeout)
+	rssLog.Printf("worker started: interval=%s timeout=%s", w.fetchInterval, w.httpClient.Timeout)
 	go w.fetchAllFeeds()
 	go w.loop()
 }
@@ -66,7 +69,7 @@ func (w *Worker) loop() {
 
 func (w *Worker) fetchAllFeeds() {
 	if !w.refreshing.CompareAndSwap(false, true) {
-		log.Printf("[rss] refresh skipped: previous refresh still running")
+		rssLog.Printf("refresh skipped: previous refresh still running")
 		return
 	}
 	defer w.refreshing.Store(false)
@@ -75,31 +78,31 @@ func (w *Worker) fetchAllFeeds() {
 	var feeds []models.Feed
 
 	if err := db.Where("enabled = ?", true).Find(&feeds).Error; err != nil {
-		log.Printf("[rss] failed to load enabled feeds: %v", err)
+		rssLog.Printf("failed to load enabled feeds: %v", err)
 		metrics.RSSFetchError.Add(1)
 		return
 	}
 
 	startedAt := time.Now()
-	log.Printf("[rss] refreshing %d enabled feeds", len(feeds))
+	rssLog.Printf("refreshing %d enabled feeds", len(feeds))
 
 	for _, feed := range feeds {
 		w.fetchFeed(feed)
 	}
 
-	log.Printf("[rss] refresh finished in %s", time.Since(startedAt).Round(time.Millisecond))
+	rssLog.Printf("refresh finished in %s", time.Since(startedAt).Round(time.Millisecond))
 }
 
 func (w *Worker) fetchFeed(feed models.Feed) {
 	metrics.RSSFetchTotal.Add(1)
 	startedAt := time.Now()
-	log.Printf("[rss] fetching feed %q", feed.Name)
+	rssLog.Printf("fetching feed %q", feed.Name)
 
 	parser := gofeed.NewParser()
 	parser.Client = w.httpClient
 	parsed, err := parser.ParseURL(feed.URL)
 	if err != nil {
-		log.Printf("[rss] fetch failed for %q: %v", feed.Name, err)
+		rssLog.Printf("fetch failed for %q: %v", feed.Name, err)
 		metrics.RSSFetchError.Add(1)
 		return
 	}
@@ -119,7 +122,7 @@ func (w *Worker) fetchFeed(feed models.Feed) {
 		if err := db.Where("feed_id = ? AND url = ?", feed.ID, itemURL).First(&existingItem).Error; err == nil {
 			continue
 		} else if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-			log.Printf("[rss] failed to check existing item %q: %v", title, err)
+			rssLog.Printf("failed to check existing item %q: %v", title, err)
 			continue
 		}
 
@@ -143,7 +146,7 @@ func (w *Worker) fetchFeed(feed models.Feed) {
 			if isDuplicateItemError(err) {
 				continue
 			}
-			log.Printf("[rss] failed to save item %q: %v", title, err)
+			rssLog.Printf("failed to save item %q: %v", title, err)
 			continue
 		}
 
@@ -151,7 +154,7 @@ func (w *Worker) fetchFeed(feed models.Feed) {
 		newItems++
 	}
 
-	log.Printf("[rss] feed %q refreshed: %d items fetched, %d new, took %s", feed.Name, len(parsed.Items), newItems, time.Since(startedAt).Round(time.Millisecond))
+	rssLog.Printf("feed %q refreshed: %d items fetched, %d new, took %s", feed.Name, len(parsed.Items), newItems, time.Since(startedAt).Round(time.Millisecond))
 }
 
 func normalizeItemURL(raw string) string {
@@ -184,25 +187,25 @@ func (w *Worker) extractImage(item *gofeed.Item) string {
 
 	// Stage 1: <media:thumbnail> — used by BBC, Yahoo, and many major news feeds
 	if imgURL := w.extractFromMediaThumbnail(item); imgURL != "" {
-		log.Printf("[image] media:thumbnail: %s", imgURL)
+		imageLog.Printf("media:thumbnail: %s", imgURL)
 		return imgURL
 	}
 
 	// Stage 2: <media:content> with medium="image" — another Media RSS variant
 	if imgURL := w.extractFromMediaContent(item); imgURL != "" {
-		log.Printf("[image] media:content: %s", imgURL)
+		imageLog.Printf("media:content: %s", imgURL)
 		return imgURL
 	}
 
 	// Stage 3: gofeed native item.Image field
 	if imgURL := w.extractFromItemImage(item); imgURL != "" {
-		log.Printf("[image] item.Image: %s", imgURL)
+		imageLog.Printf("item.Image: %s", imgURL)
 		return imgURL
 	}
 
 	// Stage 4: RSS <enclosure type="image/...">
 	if imgURL := w.extractFromEnclosures(item); imgURL != "" {
-		log.Printf("[image] enclosure: %s", imgURL)
+		imageLog.Printf("enclosure: %s", imgURL)
 		return imgURL
 	}
 
@@ -212,25 +215,25 @@ func (w *Worker) extractImage(item *gofeed.Item) string {
 		content = item.Description
 	}
 	if imgURL := w.extractImgFromHTML(content); imgURL != "" {
-		log.Printf("[image] html img: %s", imgURL)
+		imageLog.Printf("html img: %s", imgURL)
 		return imgURL
 	}
 
 	// Stage 6: iTunes-style <itunes:image href="...">
 	if imgURL := w.extractFromITunes(item); imgURL != "" {
-		log.Printf("[image] itunes:image: %s", imgURL)
+		imageLog.Printf("itunes:image: %s", imgURL)
 		return imgURL
 	}
 
 	// Stage 7: scrape the linked article page for og:image / twitter:image
 	if item.Link != "" {
 		if imgURL := w.extractFromWebPage(item.Link); imgURL != "" {
-			log.Printf("[image] webpage: %s", imgURL)
+			imageLog.Printf("webpage: %s", imgURL)
 			return imgURL
 		}
 	}
 
-	log.Printf("[image] no image found for item: %s", item.Link)
+	imageLog.Printf("no image found for item: %s", item.Link)
 	return ""
 }
 

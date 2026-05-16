@@ -4,16 +4,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/esp32-rss-display/backend/server/database"
+	"github.com/esp32-rss-display/backend/server/logger"
 	"github.com/esp32-rss-display/backend/server/metrics"
 	"github.com/esp32-rss-display/backend/server/models"
 	"gorm.io/gorm"
 )
+
+var apiLog = logger.Get("api")
+var ratingLog = logger.Get("rating")
 
 type NextItemResponse struct {
 	ItemID   uint   `json:"item_id"`
@@ -171,7 +174,7 @@ func PostItemRating(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to save rating", http.StatusInternalServerError)
 		return
 	}
-	log.Printf("[rating] Updated rating for item %d from device %s: %d", itemID, req.DeviceID, req.Rating)
+	ratingLog.Printf("Updated rating for item %d from device %s: %d", itemID, req.DeviceID, req.Rating)
 
 	w.WriteHeader(http.StatusNoContent)
 }

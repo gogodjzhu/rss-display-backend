@@ -2,7 +2,6 @@ package image
 
 import (
 	"image"
-	"log"
 	"net/http"
 	"path/filepath"
 	"strconv"
@@ -11,10 +10,13 @@ import (
 	"github.com/esp32-rss-display/backend/server/api"
 	"github.com/esp32-rss-display/backend/server/config"
 	"github.com/esp32-rss-display/backend/server/database"
+	"github.com/esp32-rss-display/backend/server/logger"
 	"github.com/esp32-rss-display/backend/server/metrics"
 	"github.com/esp32-rss-display/backend/server/models"
 	rssworker "github.com/esp32-rss-display/backend/server/rss"
 )
+
+var imageLog = logger.Get("image")
 
 type Handler struct {
 	renderer *rssworker.Renderer
@@ -76,7 +78,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			metrics.ImageDownloadFailureTotal.Add(1)
 			metrics.ImageColorCardTotal.Add(1)
-			log.Printf("[image] render failed for item %d from %s: %v", item.ID, item.ImageURL, err)
+			imageLog.Printf("render failed for item %d from %s: %v", item.ID, item.ImageURL, err)
 
 			card := h.renderer.GenerateColorCard(item.Title)
 			h.renderer.OverlayTextFull(card, feed.Name, item.Title, pubTime)

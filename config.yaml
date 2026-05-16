@@ -13,6 +13,16 @@ rss:
   image_download_timeout_seconds: 3
   feed_fetch_timeout_seconds: 10
 
+pipeline:
+  python_path: "python3"
+  script_path: "py/pipeline.py"
+  data_dir: "/data/pipeline"
+  rate_limit_min_seconds: 30
+  rate_limit_max_seconds: 90
+
+log:
+  dir: "/data/logs/rss-display-backend"
+
 feeds:
   - name: HackerNews
     url: https://news.ycombinator.com/rss

@@ -3,18 +3,20 @@ package database
 import (
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/esp32-rss-display/backend/server/config"
+	applogger "github.com/esp32-rss-display/backend/server/logger"
 	"github.com/esp32-rss-display/backend/server/models"
 	"github.com/glebarez/sqlite"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
+
+var dbLog = applogger.Get("database")
 
 var DB *gorm.DB
 
@@ -55,12 +57,13 @@ func Init(cfg *config.DatabaseConfig) error {
 		&models.ItemShow{},
 		&models.ItemRead{},
 		&models.ItemRating{},
+		&models.Task{},
 	); err != nil {
 		return fmt.Errorf("failed to migrate database: %w", err)
 	}
 
 	DB = db
-	log.Println("Database connected and migrated successfully")
+	dbLog.Println("Database connected and migrated successfully")
 	return nil
 }
 

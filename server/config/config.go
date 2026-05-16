@@ -10,6 +10,8 @@ type Config struct {
 	Database DatabaseConfig `yaml:"database"`
 	Server   ServerConfig   `yaml:"server"`
 	RSS      RSSConfig      `yaml:"rss"`
+	Pipeline PipelineConfig `yaml:"pipeline"`
+	Log      LogConfig      `yaml:"log"`
 	Feeds    []FeedConfig   `yaml:"feeds"`
 }
 
@@ -35,6 +37,18 @@ type FeedConfig struct {
 	Name    string `yaml:"name"`
 	URL     string `yaml:"url"`
 	Enabled bool   `yaml:"enabled"`
+}
+
+type PipelineConfig struct {
+	PythonPath          string `yaml:"python_path"`
+	ScriptPath          string `yaml:"script_path"`
+	DataDir             string `yaml:"data_dir"`
+	RateLimitMinSeconds int    `yaml:"rate_limit_min_seconds"`
+	RateLimitMaxSeconds int    `yaml:"rate_limit_max_seconds"`
+}
+
+type LogConfig struct {
+	Dir string `yaml:"dir"`
 }
 
 var AppConfig *Config
