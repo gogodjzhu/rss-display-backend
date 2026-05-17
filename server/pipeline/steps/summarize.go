@@ -5,21 +5,20 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/esp32-rss-display/backend/server/models"
 	"github.com/esp32-rss-display/backend/server/pipeline"
-	"gorm.io/gorm"
 )
 
 // SummarizeStep generates an abstract for each crawled item and persists it
 // to the database. It writes the list of summarised IDs to state under "summarize".
 type SummarizeStep struct {
-	db     *gorm.DB
+	items  ItemFinder
+	update ItemUpdater
 	runner *pipeline.PythonRunner
 }
 
 // NewSummarizeStep constructs a SummarizeStep.
-func NewSummarizeStep(db *gorm.DB, runner *pipeline.PythonRunner) *SummarizeStep {
-	return &SummarizeStep{db: db, runner: runner}
+func NewSummarizeStep(items ItemFinder, update ItemUpdater, runner *pipeline.PythonRunner) *SummarizeStep {
+	return &SummarizeStep{items: items, update: update, runner: runner}
 }
 
 func (s *SummarizeStep) Name() string { return "summarize" }
@@ -41,9 +40,24 @@ func (s *SummarizeStep) Run(ctx context.Context, state pipeline.StateAccessor) e
 		return pipeline.SetState(state, s.Name(), SummarizeOutput{SummarizedIDs: nil})
 	}
 
-	var items []models.Item
-	if err := s.db.Where("id IN ? AND content != ''", crawl.CrawledIDs).Find(&items).Error; err != nil {
+	itemList, err := s.items.FindByIDs(ctx, crawl.CrawledIDs)
+	if err != nil {
 		return fmt.Errorf("summarize: get items: %w", err)
+	}
+
+	var filteredItems []struct {
+		ID      uint
+		Title   string
+		Content string
+	}
+	for _, item := range itemList {
+		if item.Content != "" {
+			filteredItems = append(filteredItems, struct {
+				ID      uint
+				Title   string
+				Content string
+			}{ID: item.ID, Title: item.Title, Content: item.Content})
+		}
 	}
 
 	type itemEntry struct {
@@ -51,8 +65,8 @@ func (s *SummarizeStep) Run(ctx context.Context, state pipeline.StateAccessor) e
 		Title   string `json:"title"`
 		Content string `json:"content"`
 	}
-	entries := make([]itemEntry, len(items))
-	for i, item := range items {
+	entries := make([]itemEntry, len(filteredItems))
+	for i, item := range filteredItems {
 		entries[i] = itemEntry{ID: item.ID, Title: item.Title, Content: item.Content}
 	}
 
@@ -81,8 +95,7 @@ func (s *SummarizeStep) Run(ctx context.Context, state pipeline.StateAccessor) e
 	var summarizedIDs []uint
 	for _, r := range pyOutput.Results {
 		if r.Abstract != "" {
-			if err := s.db.Model(&models.Item{}).Where("id = ?", r.ID).
-				Update("abstract", r.Abstract).Error; err != nil {
+			if err := s.update.UpdateAbstract(ctx, r.ID, r.Abstract); err != nil {
 				return fmt.Errorf("summarize: update item %d: %w", r.ID, err)
 			}
 		}

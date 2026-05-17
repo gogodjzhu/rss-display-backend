@@ -14,8 +14,11 @@ import (
 	"github.com/esp32-rss-display/backend/server/api"
 	"github.com/esp32-rss-display/backend/server/config"
 	"github.com/esp32-rss-display/backend/server/database"
+	admindomain "github.com/esp32-rss-display/backend/server/domain/admin"
+	"github.com/esp32-rss-display/backend/server/domain/devices"
 	"github.com/esp32-rss-display/backend/server/domain/feeds"
-	"github.com/esp32-rss-display/backend/server/image"
+	"github.com/esp32-rss-display/backend/server/domain/items"
+	"github.com/esp32-rss-display/backend/server/domain/jobs"
 	"github.com/esp32-rss-display/backend/server/logger"
 	"github.com/esp32-rss-display/backend/server/pipeline"
 	"github.com/esp32-rss-display/backend/server/pipeline/steps"
@@ -54,13 +57,27 @@ func runServer(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	if err := database.Init(&cfg.Database); err != nil {
+	db, err := database.Init(&cfg.Database)
+	if err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
 
-	feedSvc := feeds.NewService(feeds.NewGORMRepository())
-	db := database.GetDB()
-	if err := feedSvc.InitFeeds(context.Background(), db, cfg.Feeds); err != nil {
+	// Domain services
+	deviceRepo := devices.NewGORMRepository(db)
+	deviceSvc := devices.NewService(deviceRepo)
+
+	feedRepo := feeds.NewGORMRepository(db)
+	feedSvc := feeds.NewService(feedRepo)
+
+	itemRepo := items.NewGORMRepository(db)
+	itemSvc := items.NewService(itemRepo)
+	selector := items.NewWeightedItemSelector(itemRepo)
+
+	jobRepo := jobs.NewGORMRepository(db)
+
+	readModel := admindomain.NewGORMReadModel(db)
+
+	if err := feedSvc.InitFeeds(context.Background(), cfg.Feeds); err != nil {
 		log.Fatalf("Failed to initialise feeds: %v", err)
 	}
 
@@ -77,35 +94,47 @@ func runServer(cmd *cobra.Command, args []string) {
 		ScriptPath: cfg.Pipeline.ScriptPath,
 		DataDir:    cfg.Pipeline.DataDir,
 	}
-	jobStore := database.NewGORMJobStore(db)
+	jobStoreAdapter := jobs.NewGORMJobStoreAdapter(jobRepo)
 	stateManager := pipeline.NewFileStateManager(stateDir)
-	runner := pipeline.NewRunner(jobStore, stateManager, log.Default())
-	rssPipeline := steps.BuildRSSPipeline(db, pythonRunner, cfg.Pipeline.RateLimitMinSeconds, cfg.Pipeline.RateLimitMaxSeconds)
+	runner := pipeline.NewRunner(jobStoreAdapter, stateManager, log.Default())
+	jobSvc := jobs.NewService(jobRepo, runner)
+
+	// Build the pipeline with domain services instead of raw DB.
+	rssPipeline := steps.BuildRSSPipeline(
+		deviceSvc, itemSvc, itemSvc, itemSvc, jobSvc,
+		pythonRunner, cfg.Pipeline.RateLimitMinSeconds, cfg.Pipeline.RateLimitMaxSeconds,
+	)
 	if err := runner.Register(rssPipeline); err != nil {
 		log.Fatalf("Failed to register RSS pipeline: %v", err)
 	}
 	if err := runner.Recover(context.Background()); err != nil {
 		log.Fatalf("Failed to recover pending pipeline jobs: %v", err)
 	}
+
+	// HTTP handlers
+	apiHandler := api.NewDefaultHandler(deviceSvc, itemSvc, feedSvc, selector)
+	taskHandler := api.NewTaskHandler(deviceSvc, jobSvc)
+	redirectHandler := api.NewRedirectHandler(deviceSvc, itemSvc)
+	imageHandler := api.NewImageHandler(&cfg.RSS, itemSvc, feedSvc)
 	api.InitRunner(runner)
 
 	mux := http.NewServeMux()
 
 	mux.Handle("/metrics", promhttp.Handler())
-	admin.Mount(mux)
-	mux.HandleFunc("GET /v1/device/{device_id}/next", api.GetNextItem)
-	mux.HandleFunc("POST /v1/item/{item_id}/rating", api.PostItemRating)
-	mux.HandleFunc("PUT /v1/device/{device_id}/preference", api.PutDevicePreference)
-	mux.HandleFunc("POST /v1/device/{device_id}/job", api.PostDeviceJob)
-	mux.HandleFunc("GET /v1/device/{device_id}/job", api.GetDeviceJob)
-	mux.HandleFunc("GET /v1/device/{device_id}/job/{job_id}", api.GetDeviceJobByID)
-	image.Mount(mux, &cfg.RSS)
-	mux.HandleFunc("GET /nfc/{device_id}", api.NFCRedirect)
+	admin.Mount(mux, readModel)
+	mux.HandleFunc("POST /v1/device/{device_id}/job", taskHandler.PostDeviceJob)
+	mux.HandleFunc("GET  /v1/device/{device_id}/next", apiHandler.GetNextItem)
+	mux.HandleFunc("PUT  /v1/device/{device_id}/preference", taskHandler.PutDevicePreference)
+	mux.HandleFunc("GET  /v1/device/{device_id}/job", taskHandler.GetDeviceJob)
+	mux.HandleFunc("GET  /v1/device/{device_id}/job/{job_id}", taskHandler.GetDeviceJobByID)
+	mux.HandleFunc("POST /v1/item/{item_id}/rating", apiHandler.PostItemRating)
+	mux.HandleFunc("GET  /image/", imageHandler.ShowImage)
+	mux.HandleFunc("GET  /nfc/{device_id}", redirectHandler.Redirect)
 
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 	logger.Get("server").Printf("Starting server on %s", addr)
 
-	worker := rssworker.New(&cfg.RSS)
+	worker := rssworker.New(&cfg.RSS, feedSvc, itemSvc)
 	worker.Start()
 
 	go func() {

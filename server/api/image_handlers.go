@@ -1,4 +1,4 @@
-package image
+package api
 
 import (
 	"image"
@@ -7,26 +7,31 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/esp32-rss-display/backend/server/api"
 	"github.com/esp32-rss-display/backend/server/config"
-	"github.com/esp32-rss-display/backend/server/database"
+	"github.com/esp32-rss-display/backend/server/domain/feeds"
+	"github.com/esp32-rss-display/backend/server/domain/items"
 	"github.com/esp32-rss-display/backend/server/logger"
 	"github.com/esp32-rss-display/backend/server/metrics"
-	"github.com/esp32-rss-display/backend/server/models"
 	rssworker "github.com/esp32-rss-display/backend/server/rss"
 )
 
 var imageLog = logger.Get("image")
 
-type Handler struct {
+type ImageHandler struct {
 	renderer *rssworker.Renderer
+	itemSvc  items.Service
+	feedSvc  feeds.Service
 }
 
-func New(cfg *config.RSSConfig) *Handler {
-	return &Handler{renderer: rssworker.NewRenderer(cfg)}
+func NewImageHandler(cfg *config.RSSConfig, itemSvc items.Service, feedSvc feeds.Service) *ImageHandler {
+	return &ImageHandler{
+		renderer: rssworker.NewRenderer(cfg),
+		itemSvc:  itemSvc,
+		feedSvc:  feedSvc,
+	}
 }
 
-func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (h *ImageHandler) ShowImage(w http.ResponseWriter, r *http.Request) {
 	base := filepath.Base(r.URL.Path)
 	idStr := base[:len(base)-len(filepath.Ext(base))]
 
@@ -36,9 +41,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if id == uint64(api.PlaceholderItemID) {
-		card := h.renderer.GenerateColorCard(api.PlaceholderTitle)
-		h.renderer.OverlayTextFull(card, "System", api.PlaceholderTitle, time.Now().UTC())
+	if id == uint64(PlaceholderItemID) {
+		card := h.renderer.GenerateColorCard(PlaceholderTitle)
+		h.renderer.OverlayTextFull(card, "System", PlaceholderTitle, time.Now().UTC())
 		encoded, err := h.renderer.EncodeJPEG(card)
 		if err != nil {
 			http.Error(w, "Failed to render image", http.StatusInternalServerError)
@@ -51,19 +56,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	db := database.GetDB()
+	ctx := r.Context()
 	metrics.ImageRenderTotal.Add(1)
 
-	var item models.Item
-	if err := db.Select("id", "feed_id", "title", "image_url", "published_at", "created_at").First(&item, id).Error; err != nil {
+	item, err := h.itemSvc.FindByIDFull(ctx, uint(id))
+	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
 
-	var feed models.Feed
-	if err := db.Select("name").First(&feed, item.FeedID).Error; err != nil {
-		http.Error(w, "Feed not found", http.StatusInternalServerError)
-		return
+	feedName := "System"
+	if item.FeedID != 0 {
+		feed, err := h.feedSvc.FindByID(ctx, item.FeedID)
+		if err == nil && feed != nil {
+			feedName = feed.Name
+		}
 	}
 
 	pubTime := item.CreatedAt
@@ -81,17 +88,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			imageLog.Printf("render failed for item %d from %s: %v", item.ID, item.ImageURL, err)
 
 			card := h.renderer.GenerateColorCard(item.Title)
-			h.renderer.OverlayTextFull(card, feed.Name, item.Title, pubTime)
+			h.renderer.OverlayTextFull(card, feedName, item.Title, pubTime)
 			canvas = card
 		} else {
 			photo := h.renderer.ResizeImage(src)
-			h.renderer.OverlayText(photo, feed.Name, item.Title, pubTime)
+			h.renderer.OverlayText(photo, feedName, item.Title, pubTime)
 			canvas = photo
 		}
 	} else {
 		metrics.ImageColorCardTotal.Add(1)
 		card := h.renderer.GenerateColorCard(item.Title)
-		h.renderer.OverlayTextFull(card, feed.Name, item.Title, pubTime)
+		h.renderer.OverlayTextFull(card, feedName, item.Title, pubTime)
 		canvas = card
 	}
 
@@ -104,9 +111,4 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "image/jpeg")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write(encoded)
-}
-
-func Mount(mux *http.ServeMux, cfg *config.RSSConfig) {
-	handler := New(cfg)
-	mux.Handle("/image/", handler)
 }

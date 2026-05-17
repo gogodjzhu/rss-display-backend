@@ -20,7 +20,7 @@ var dbLog = applogger.Get("database")
 
 var DB *gorm.DB
 
-func Init(cfg *config.DatabaseConfig) error {
+func Init(cfg *config.DatabaseConfig) (*gorm.DB, error) {
 	var db *gorm.DB
 	var err error
 
@@ -33,7 +33,7 @@ func Init(cfg *config.DatabaseConfig) error {
 		fallthrough
 	default:
 		if err := os.MkdirAll(filepath.Dir(cfg.DSN), 0755); err != nil {
-			return fmt.Errorf("failed to create database directory: %w", err)
+			return nil, fmt.Errorf("failed to create database directory: %w", err)
 		}
 		db, err = gorm.Open(sqlite.Open(cfg.DSN), &gorm.Config{
 			Logger: logger.Default.LogMode(logger.Silent),
@@ -41,12 +41,12 @@ func Init(cfg *config.DatabaseConfig) error {
 	}
 
 	if err != nil {
-		return fmt.Errorf("failed to connect to database: %w", err)
+		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
 	if db.Migrator().HasTable(&models.Item{}) {
 		if err := normalizeItemURLs(db); err != nil {
-			return fmt.Errorf("failed to normalize existing item urls: %w", err)
+			return nil, fmt.Errorf("failed to normalize existing item urls: %w", err)
 		}
 	}
 
@@ -60,16 +60,12 @@ func Init(cfg *config.DatabaseConfig) error {
 		&models.Task{},
 		&models.Job{},
 	); err != nil {
-		return fmt.Errorf("failed to migrate database: %w", err)
+		return nil, fmt.Errorf("failed to migrate database: %w", err)
 	}
 
 	DB = db
 	dbLog.Println("Database connected and migrated successfully")
-	return nil
-}
-
-func GetDB() *gorm.DB {
-	return DB
+	return db, nil
 }
 
 func normalizeItemURLs(db *gorm.DB) error {

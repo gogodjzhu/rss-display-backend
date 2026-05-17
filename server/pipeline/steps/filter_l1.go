@@ -3,26 +3,23 @@ package steps
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"time"
 
-	"github.com/esp32-rss-display/backend/server/models"
 	"github.com/esp32-rss-display/backend/server/pipeline"
-	"gorm.io/gorm"
 )
 
 // FilterL1Step reads items in the configured time range, sends them to the Python
 // filter-level-1 script together with device context, and stores the selected IDs
 // in state under "filter_l1".
 type FilterL1Step struct {
-	db     *gorm.DB
-	runner *pipeline.PythonRunner
+	devices DeviceGetter
+	items   ItemRanger
+	runner  *pipeline.PythonRunner
 }
 
 // NewFilterL1Step constructs a FilterL1Step.
-func NewFilterL1Step(db *gorm.DB, runner *pipeline.PythonRunner) *FilterL1Step {
-	return &FilterL1Step{db: db, runner: runner}
+func NewFilterL1Step(devices DeviceGetter, items ItemRanger, runner *pipeline.PythonRunner) *FilterL1Step {
+	return &FilterL1Step{devices: devices, items: items, runner: runner}
 }
 
 func (s *FilterL1Step) Name() string { return "filter_l1" }
@@ -40,12 +37,12 @@ func (s *FilterL1Step) Run(ctx context.Context, state pipeline.StateAccessor) er
 		return err
 	}
 
-	device, err := getDevice(s.db, input.DeviceID)
+	device, err := s.devices.GetOrCreate(ctx, input.DeviceID)
 	if err != nil {
 		return fmt.Errorf("filter_l1: get device: %w", err)
 	}
 
-	items, err := getItemsInRange(s.db, input.TimeRangeStart, input.TimeRangeEnd)
+	itemList, err := s.items.FindByTimeRange(ctx, input.TimeRangeStart, input.TimeRangeEnd)
 	if err != nil {
 		return fmt.Errorf("filter_l1: get items: %w", err)
 	}
@@ -55,8 +52,8 @@ func (s *FilterL1Step) Run(ctx context.Context, state pipeline.StateAccessor) er
 		Title string `json:"title"`
 		URL   string `json:"url"`
 	}
-	entries := make([]itemEntry, len(items))
-	for i, item := range items {
+	entries := make([]itemEntry, len(itemList))
+	for i, item := range itemList {
 		entries[i] = itemEntry{ID: item.ID, Title: item.Title, URL: item.URL}
 	}
 
@@ -86,50 +83,4 @@ func (s *FilterL1Step) Run(ctx context.Context, state pipeline.StateAccessor) er
 	}
 
 	return pipeline.SetState(state, s.Name(), FilterL1Output{Level1IDs: pyOutput.Level1IDs})
-}
-
-// getDevice fetches a Device by deviceID, creating a minimal one if absent.
-func getDevice(db *gorm.DB, deviceID string) (*models.Device, error) {
-	var device models.Device
-	err := db.Where("device_id = ?", deviceID).First(&device).Error
-	if err != nil {
-		if isNotFound(err) {
-			device = models.Device{DeviceID: deviceID, CreatedAt: time.Now(), LastSeen: time.Now()}
-			if createErr := db.Create(&device).Error; createErr != nil {
-				return nil, fmt.Errorf("create device: %w", createErr)
-			}
-			return &device, nil
-		}
-		return nil, fmt.Errorf("get device: %w", err)
-	}
-	return &device, nil
-}
-
-// getItemsInRange returns items whose published_at or created_at falls in [start, end].
-func getItemsInRange(db *gorm.DB, start, end time.Time) ([]models.Item, error) {
-	var items []models.Item
-	err := db.Where(
-		"(published_at BETWEEN ? AND ?) OR (published_at IS NULL AND created_at BETWEEN ? AND ?)",
-		start, end, start, end,
-	).Find(&items).Error
-	if err != nil {
-		return nil, fmt.Errorf("get items in range: %w", err)
-	}
-	return items, nil
-}
-
-func isNotFound(err error) bool {
-	return err != nil && err.Error() == "record not found"
-}
-
-// tempIOPaths returns temp file paths for Python I/O and a cleanup function.
-func tempIOPaths(prefix string) (inPath, outPath string, cleanup func()) {
-	ts := time.Now().UnixNano()
-	inPath = filepath.Join(os.TempDir(), fmt.Sprintf("%s_%d_in.json", prefix, ts))
-	outPath = filepath.Join(os.TempDir(), fmt.Sprintf("%s_%d_out.json", prefix, ts))
-	cleanup = func() {
-		os.Remove(inPath)
-		os.Remove(outPath)
-	}
-	return
 }

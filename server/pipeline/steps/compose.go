@@ -7,22 +7,22 @@ import (
 	"strings"
 	"time"
 
-	"github.com/esp32-rss-display/backend/server/models"
 	"github.com/esp32-rss-display/backend/server/pipeline"
-	"gorm.io/gorm"
 )
 
 // ComposeStep builds the final personalised report from Level-2 items.
 // It writes the report and Level-2 IDs back to the models.Job row so
 // the HTTP API can return them, and also stores the output in state under "compose".
 type ComposeStep struct {
-	db     *gorm.DB
-	runner *pipeline.PythonRunner
+	devices DeviceGetter
+	items   ItemFinder
+	jobs    JobReporter
+	runner  *pipeline.PythonRunner
 }
 
 // NewComposeStep constructs a ComposeStep.
-func NewComposeStep(db *gorm.DB, runner *pipeline.PythonRunner) *ComposeStep {
-	return &ComposeStep{db: db, runner: runner}
+func NewComposeStep(devices DeviceGetter, items ItemFinder, jobs JobReporter, runner *pipeline.PythonRunner) *ComposeStep {
+	return &ComposeStep{devices: devices, items: items, jobs: jobs, runner: runner}
 }
 
 func (s *ComposeStep) Name() string { return "compose" }
@@ -45,21 +45,34 @@ func (s *ComposeStep) Run(ctx context.Context, state pipeline.StateAccessor) err
 		return err
 	}
 
-	// Retrieve the job ID that the Runner stored in state.
 	jobID, err := pipeline.GetState[uint](state, "job_id")
 	if err != nil {
 		return err
 	}
 
-	device, err := getDevice(s.db, input.DeviceID)
+	device, err := s.devices.GetOrCreate(ctx, input.DeviceID)
 	if err != nil {
 		return fmt.Errorf("compose: get device: %w", err)
 	}
 
-	var items []models.Item
+	var itemList []struct {
+		ID       uint
+		Title    string
+		Abstract string
+		URL      string
+	}
 	if len(l2.Level2IDs) > 0 {
-		if err := s.db.Where("id IN ?", l2.Level2IDs).Find(&items).Error; err != nil {
+		items, err := s.items.FindByIDs(ctx, l2.Level2IDs)
+		if err != nil {
 			return fmt.Errorf("compose: get items: %w", err)
+		}
+		for _, item := range items {
+			itemList = append(itemList, struct {
+				ID       uint
+				Title    string
+				Abstract string
+				URL      string
+			}{ID: item.ID, Title: item.Title, Abstract: item.Abstract, URL: item.URL})
 		}
 	}
 
@@ -69,8 +82,8 @@ func (s *ComposeStep) Run(ctx context.Context, state pipeline.StateAccessor) err
 		Abstract string `json:"abstract"`
 		URL      string `json:"url"`
 	}
-	entries := make([]itemEntry, len(items))
-	for i, item := range items {
+	entries := make([]itemEntry, len(itemList))
+	for i, item := range itemList {
 		entries[i] = itemEntry{ID: item.ID, Title: item.Title, Abstract: item.Abstract, URL: item.URL}
 	}
 
@@ -99,14 +112,7 @@ func (s *ComposeStep) Run(ctx context.Context, state pipeline.StateAccessor) err
 		return fmt.Errorf("compose: read output: %w", err)
 	}
 
-	// Persist report and level2_ids back to the Job row for API consumers.
-	level2IDsJSON := marshalIDs(l2.Level2IDs)
-	if err := s.db.Model(&models.Job{}).Where("id = ?", jobID).
-		Updates(map[string]any{
-			"report":     pyOutput.Report,
-			"level2_ids": level2IDsJSON,
-			"updated_at": time.Now(),
-		}).Error; err != nil {
+	if err := s.jobs.UpdateReport(ctx, jobID, pyOutput.Report, l2.Level2IDs); err != nil {
 		return fmt.Errorf("compose: persist to job: %w", err)
 	}
 

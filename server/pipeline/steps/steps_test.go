@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/esp32-rss-display/backend/server/domain/devices"
+	"github.com/esp32-rss-display/backend/server/domain/items"
 	"github.com/esp32-rss-display/backend/server/models"
 	"github.com/esp32-rss-display/backend/server/pipeline"
 	"github.com/esp32-rss-display/backend/server/pipeline/steps"
@@ -14,8 +16,6 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
-
-// ── test helpers ──────────────────────────────────────────────────────────────
 
 func newDB(t *testing.T) *gorm.DB {
 	t.Helper()
@@ -55,30 +55,68 @@ func seedDB(t *testing.T, db *gorm.DB) (models.Device, models.Feed, []models.Ite
 	db.Create(&feed)
 
 	pub := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
-	items := []models.Item{
+	itemList := []models.Item{
 		{FeedID: feed.ID, Title: "Go 1.24", URL: "https://example.com/go124", PublishedAt: &pub},
 		{FeedID: feed.ID, Title: "Kubernetes Tips", URL: "https://example.com/k8s", PublishedAt: &pub},
 		{FeedID: feed.ID, Title: "Celebrity Gossip", URL: "https://example.com/gossip", PublishedAt: &pub},
 	}
-	for i := range items {
-		db.Create(&items[i])
+	for i := range itemList {
+		db.Create(&itemList[i])
 	}
-	return device, feed, items
+	return device, feed, itemList
+}
+
+// stub implementations for domain interfaces
+
+type stubDeviceGetter struct {
+	device *models.Device
+	err    error
+}
+
+func (s *stubDeviceGetter) GetOrCreate(ctx context.Context, deviceID string) (*models.Device, error) {
+	return s.device, s.err
+}
+
+type stubItemRanger struct {
+	items []models.Item
+	err   error
+}
+
+func (s *stubItemRanger) FindByTimeRange(ctx context.Context, start, end time.Time) ([]models.Item, error) {
+	return s.items, s.err
+}
+
+type stubItemFinder struct {
+	items []models.Item
+	err   error
+}
+
+func (s *stubItemFinder) FindByIDs(ctx context.Context, ids []uint) ([]models.Item, error) {
+	return s.items, s.err
+}
+
+type stubItemUpdater struct{}
+
+func (s *stubItemUpdater) UpdateContent(ctx context.Context, id uint, content string) error { return nil }
+func (s *stubItemUpdater) UpdateAbstract(ctx context.Context, id uint, abstract string) error { return nil }
+
+type stubJobReporter struct{}
+
+func (s *stubJobReporter) UpdateReport(ctx context.Context, jobID uint, report string, level2IDs []uint) error {
+	return nil
 }
 
 // ── FilterL1Step ──────────────────────────────────────────────────────────────
 
 func TestFilterL1StepName(t *testing.T) {
-	db := newDB(t)
-	s := steps.NewFilterL1Step(db, &pipeline.PythonRunner{})
+	s := steps.NewFilterL1Step(&stubDeviceGetter{}, &stubItemRanger{}, &pipeline.PythonRunner{})
 	if s.Name() != "filter_l1" {
 		t.Errorf("Name() = %q, want %q", s.Name(), "filter_l1")
 	}
 }
 
 func TestFilterL1StepConfigHasTimeout(t *testing.T) {
-	db := newDB(t)
-	s := steps.NewFilterL1Step(db, &pipeline.PythonRunner{})
+	s := steps.NewFilterL1Step(&stubDeviceGetter{}, &stubItemRanger{}, &pipeline.PythonRunner{})
 	cfg := s.Config()
 	if cfg.Timeout <= 0 {
 		t.Error("FilterL1Step config timeout should be positive")
@@ -89,8 +127,7 @@ func TestFilterL1StepConfigHasTimeout(t *testing.T) {
 }
 
 func TestFilterL1StepRunFailsWithoutJobInput(t *testing.T) {
-	db := newDB(t)
-	s := steps.NewFilterL1Step(db, &pipeline.PythonRunner{})
+	s := steps.NewFilterL1Step(&stubDeviceGetter{}, &stubItemRanger{}, &pipeline.PythonRunner{})
 	state := newState(t)
 
 	err := s.Run(context.Background(), state)
@@ -102,22 +139,18 @@ func TestFilterL1StepRunFailsWithoutJobInput(t *testing.T) {
 // ── CrawlStep ────────────────────────────────────────────────────────────────
 
 func TestCrawlStepName(t *testing.T) {
-	db := newDB(t)
-	s := steps.NewCrawlStep(db, &pipeline.PythonRunner{}, 30, 90)
+	s := steps.NewCrawlStep(&stubItemFinder{}, &stubItemUpdater{}, &pipeline.PythonRunner{}, 30, 90)
 	if s.Name() != "crawl" {
 		t.Errorf("Name() = %q, want %q", s.Name(), "crawl")
 	}
 }
 
 func TestCrawlStepSkipsEmptyLevel1IDs(t *testing.T) {
-	db := newDB(t)
-	s := steps.NewCrawlStep(db, &pipeline.PythonRunner{}, 30, 90)
+	s := steps.NewCrawlStep(&stubItemFinder{}, &stubItemUpdater{}, &pipeline.PythonRunner{}, 30, 90)
 	state := newState(t)
 
-	// Set job_input
 	input := steps.RSSJobInput{DeviceID: "dev-001", TimeRangeStart: time.Now(), TimeRangeEnd: time.Now()}
 	pipeline.SetState(state, "job_input", input)
-	// Set empty filter_l1
 	pipeline.SetState(state, "filter_l1", steps.FilterL1Output{Level1IDs: nil})
 
 	if err := s.Run(context.Background(), state); err != nil {
@@ -134,8 +167,7 @@ func TestCrawlStepSkipsEmptyLevel1IDs(t *testing.T) {
 }
 
 func TestCrawlStepFailsWithoutFilterL1State(t *testing.T) {
-	db := newDB(t)
-	s := steps.NewCrawlStep(db, &pipeline.PythonRunner{}, 30, 90)
+	s := steps.NewCrawlStep(&stubItemFinder{}, &stubItemUpdater{}, &pipeline.PythonRunner{}, 30, 90)
 	state := newState(t)
 
 	err := s.Run(context.Background(), state)
@@ -147,16 +179,14 @@ func TestCrawlStepFailsWithoutFilterL1State(t *testing.T) {
 // ── SummarizeStep ────────────────────────────────────────────────────────────
 
 func TestSummarizeStepName(t *testing.T) {
-	db := newDB(t)
-	s := steps.NewSummarizeStep(db, &pipeline.PythonRunner{})
+	s := steps.NewSummarizeStep(&stubItemFinder{}, &stubItemUpdater{}, &pipeline.PythonRunner{})
 	if s.Name() != "summarize" {
 		t.Errorf("Name() = %q, want %q", s.Name(), "summarize")
 	}
 }
 
 func TestSummarizeStepSkipsEmptyCrawledIDs(t *testing.T) {
-	db := newDB(t)
-	s := steps.NewSummarizeStep(db, &pipeline.PythonRunner{})
+	s := steps.NewSummarizeStep(&stubItemFinder{}, &stubItemUpdater{}, &pipeline.PythonRunner{})
 	state := newState(t)
 
 	pipeline.SetState(state, "crawl", steps.CrawlOutput{CrawledIDs: nil})
@@ -177,17 +207,14 @@ func TestSummarizeStepSkipsEmptyCrawledIDs(t *testing.T) {
 // ── FilterL2Step ────────────────────────────────────────────────────────────
 
 func TestFilterL2StepName(t *testing.T) {
-	db := newDB(t)
-	s := steps.NewFilterL2Step(db, &pipeline.PythonRunner{})
+	s := steps.NewFilterL2Step(&stubDeviceGetter{}, &stubItemFinder{}, &pipeline.PythonRunner{})
 	if s.Name() != "filter_l2" {
 		t.Errorf("Name() = %q, want %q", s.Name(), "filter_l2")
 	}
 }
 
 func TestFilterL2StepSkipsEmptySummarizedIDs(t *testing.T) {
-	db := newDB(t)
-	_, _, _ = seedDB(t, db)
-	s := steps.NewFilterL2Step(db, &pipeline.PythonRunner{})
+	s := steps.NewFilterL2Step(&stubDeviceGetter{}, &stubItemFinder{}, &pipeline.PythonRunner{})
 	state := newState(t)
 
 	input := steps.RSSJobInput{DeviceID: "dev-001", TimeRangeStart: time.Now(), TimeRangeEnd: time.Now()}
@@ -210,16 +237,14 @@ func TestFilterL2StepSkipsEmptySummarizedIDs(t *testing.T) {
 // ── ComposeStep ────────────────────────────────────────────────────────────
 
 func TestComposeStepName(t *testing.T) {
-	db := newDB(t)
-	s := steps.NewComposeStep(db, &pipeline.PythonRunner{})
+	s := steps.NewComposeStep(&stubDeviceGetter{}, &stubItemFinder{}, &stubJobReporter{}, &pipeline.PythonRunner{})
 	if s.Name() != "compose" {
 		t.Errorf("Name() = %q, want %q", s.Name(), "compose")
 	}
 }
 
 func TestComposeStepFailsWithoutFilterL2State(t *testing.T) {
-	db := newDB(t)
-	s := steps.NewComposeStep(db, &pipeline.PythonRunner{})
+	s := steps.NewComposeStep(&stubDeviceGetter{}, &stubItemFinder{}, &stubJobReporter{}, &pipeline.PythonRunner{})
 	state := newState(t)
 
 	err := s.Run(context.Background(), state)
@@ -232,8 +257,13 @@ func TestComposeStepFailsWithoutFilterL2State(t *testing.T) {
 
 func TestBuildRSSPipelineHasFiveSteps(t *testing.T) {
 	db := newDB(t)
+	deviceGetter := devices.NewService(devices.NewGORMRepository(db))
+	itemFinder := items.NewService(items.NewGORMRepository(db))
+	itemRanger := items.NewService(items.NewGORMRepository(db))
+	itemUpdater := items.NewService(items.NewGORMRepository(db))
+	jobReporter := &stubJobReporter{}
 	runner := &pipeline.PythonRunner{PythonPath: "python3", ScriptPath: "py/pipeline.py"}
-	p := steps.BuildRSSPipeline(db, runner, 30, 90)
+	p := steps.BuildRSSPipeline(deviceGetter, itemFinder, itemRanger, itemUpdater, jobReporter, runner, 30, 90)
 
 	if p.Name() != steps.PipelineName {
 		t.Errorf("pipeline name = %q, want %q", p.Name(), steps.PipelineName)

@@ -9,23 +9,26 @@ import (
 	"gorm.io/gorm"
 )
 
-// Repository is the data-access contract for devices.
 type Repository interface {
-	FindByDeviceID(ctx context.Context, db *gorm.DB, deviceID string) (*models.Device, error)
-	Create(ctx context.Context, db *gorm.DB, device *models.Device) error
-	Save(ctx context.Context, db *gorm.DB, device *models.Device) error
-	FindLatestJob(ctx context.Context, db *gorm.DB, deviceID string) (*models.Job, error)
-	FindJobByID(ctx context.Context, db *gorm.DB, jobID uint, deviceID string) (*models.Job, error)
+	FindByDeviceID(ctx context.Context, deviceID string) (*models.Device, error)
+	Create(ctx context.Context, device *models.Device) error
+	Save(ctx context.Context, device *models.Device) error
+	UpdateFields(ctx context.Context, deviceID string, fields map[string]any) error
+	FindLatestJob(ctx context.Context, deviceID string) (*models.Job, error)
+	FindJobByID(ctx context.Context, jobID uint, deviceID string) (*models.Job, error)
 }
 
-// GORMRepository is the GORM-backed implementation of Repository.
-type GORMRepository struct{}
+type GORMRepository struct {
+	db *gorm.DB
+}
 
-func NewGORMRepository() *GORMRepository { return &GORMRepository{} }
+func NewGORMRepository(db *gorm.DB) *GORMRepository {
+	return &GORMRepository{db: db}
+}
 
-func (r *GORMRepository) FindByDeviceID(ctx context.Context, db *gorm.DB, deviceID string) (*models.Device, error) {
+func (r *GORMRepository) FindByDeviceID(ctx context.Context, deviceID string) (*models.Device, error) {
 	var device models.Device
-	if err := db.WithContext(ctx).Where("device_id = ?", deviceID).First(&device).Error; err != nil {
+	if err := r.db.WithContext(ctx).Where("device_id = ?", deviceID).First(&device).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, gorm.ErrRecordNotFound
 		}
@@ -34,17 +37,21 @@ func (r *GORMRepository) FindByDeviceID(ctx context.Context, db *gorm.DB, device
 	return &device, nil
 }
 
-func (r *GORMRepository) Create(ctx context.Context, db *gorm.DB, device *models.Device) error {
-	return db.WithContext(ctx).Create(device).Error
+func (r *GORMRepository) Create(ctx context.Context, device *models.Device) error {
+	return r.db.WithContext(ctx).Create(device).Error
 }
 
-func (r *GORMRepository) Save(ctx context.Context, db *gorm.DB, device *models.Device) error {
-	return db.WithContext(ctx).Save(device).Error
+func (r *GORMRepository) Save(ctx context.Context, device *models.Device) error {
+	return r.db.WithContext(ctx).Save(device).Error
 }
 
-func (r *GORMRepository) FindLatestJob(ctx context.Context, db *gorm.DB, deviceID string) (*models.Job, error) {
+func (r *GORMRepository) UpdateFields(ctx context.Context, deviceID string, fields map[string]any) error {
+	return r.db.WithContext(ctx).Model(&models.Device{}).Where("device_id = ?", deviceID).Updates(fields).Error
+}
+
+func (r *GORMRepository) FindLatestJob(ctx context.Context, deviceID string) (*models.Job, error) {
 	var job models.Job
-	if err := db.WithContext(ctx).Where("device_id = ?", deviceID).
+	if err := r.db.WithContext(ctx).Where("device_id = ?", deviceID).
 		Order("created_at DESC, id DESC").First(&job).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, gorm.ErrRecordNotFound
@@ -54,9 +61,9 @@ func (r *GORMRepository) FindLatestJob(ctx context.Context, db *gorm.DB, deviceI
 	return &job, nil
 }
 
-func (r *GORMRepository) FindJobByID(ctx context.Context, db *gorm.DB, jobID uint, deviceID string) (*models.Job, error) {
+func (r *GORMRepository) FindJobByID(ctx context.Context, jobID uint, deviceID string) (*models.Job, error) {
 	var job models.Job
-	if err := db.WithContext(ctx).Where("id = ? AND device_id = ?", jobID, deviceID).First(&job).Error; err != nil {
+	if err := r.db.WithContext(ctx).Where("id = ? AND device_id = ?", jobID, deviceID).First(&job).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, gorm.ErrRecordNotFound
 		}
@@ -65,7 +72,6 @@ func (r *GORMRepository) FindJobByID(ctx context.Context, db *gorm.DB, jobID uin
 	return &job, nil
 }
 
-// newDevice creates a default Device value for a newly-seen device ID.
 func newDevice(deviceID string) *models.Device {
 	now := time.Now()
 	return &models.Device{

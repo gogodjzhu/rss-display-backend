@@ -47,9 +47,9 @@ func createItem(t *testing.T, db *gorm.DB, feedID uint, title string, published 
 func TestWeightedItemSelectorReturnsPlaceholderWhenNoItems(t *testing.T) {
 	db := newTestDB(t)
 	now := time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
-	sel := items.NewSeededItemSelector(now, 1)
+	sel := items.NewSeededItemSelector(items.NewGORMRepository(db), now, 1)
 
-	item, err := sel.Select(context.Background(), db, models.Device{})
+	item, err := sel.Select(context.Background(), models.Device{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -70,10 +70,10 @@ func TestWeightedItemSelectorPrefersRecentItems(t *testing.T) {
 	mid := createItem(t, db, feed.ID, "mid", now.Add(-48*time.Hour))
 	newest := createItem(t, db, feed.ID, "new", now.Add(-2*time.Hour))
 
-	sel := items.NewSeededItemSelector(now, 42)
+	sel := items.NewSeededItemSelector(items.NewGORMRepository(db), now, 42)
 	counts := map[uint]int{}
 	for range 4000 {
-		item, err := sel.Select(context.Background(), db, models.Device{})
+		item, err := sel.Select(context.Background(), models.Device{})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -94,19 +94,18 @@ func TestWeightedItemSelectorAvoidsCurrentItem(t *testing.T) {
 	feed := createFeed(t, db)
 
 	itemA := createItem(t, db, feed.ID, "a", now.Add(-time.Hour))
-	itemB := createItem(t, db, feed.ID, "b", now.Add(-time.Hour))
+	_ = createItem(t, db, feed.ID, "b", now.Add(-time.Hour))
 
-	sel := items.NewSeededItemSelector(now, 99)
+	sel := items.NewSeededItemSelector(items.NewGORMRepository(db), now, 99)
 	device := models.Device{CurrentItemID: &itemA.ID}
 	for range 200 {
-		got, err := sel.Select(context.Background(), db, device)
+		got, err := sel.Select(context.Background(), device)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if got.ID == itemA.ID {
 			t.Fatalf("selector returned current item")
 		}
-		_ = itemB
 	}
 }
 
@@ -116,8 +115,8 @@ func TestWeightedItemSelectorReturnsSingleItem(t *testing.T) {
 	feed := createFeed(t, db)
 	item := createItem(t, db, feed.ID, "only", now.Add(-time.Hour))
 
-	sel := items.NewSeededItemSelector(now, 1)
-	got, err := sel.Select(context.Background(), db, models.Device{})
+	sel := items.NewSeededItemSelector(items.NewGORMRepository(db), now, 1)
+	got, err := sel.Select(context.Background(), models.Device{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

@@ -1,25 +1,36 @@
 package api
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
-	"github.com/esp32-rss-display/backend/server/database"
+	"github.com/esp32-rss-display/backend/server/domain/devices"
+	"github.com/esp32-rss-display/backend/server/domain/jobs"
+	"github.com/esp32-rss-display/backend/server/domain/items"
 	"github.com/esp32-rss-display/backend/server/models"
 	"github.com/esp32-rss-display/backend/server/pipeline"
 	"github.com/esp32-rss-display/backend/server/pipeline/steps"
-	"gorm.io/gorm"
 )
 
 var defaultRunner *pipeline.Runner
 
-// InitRunner sets the global Runner used by job endpoints.
 func InitRunner(r *pipeline.Runner) {
 	defaultRunner = r
+}
+
+type TaskHandler struct {
+	deviceSvc devices.Service
+	jobSvc    jobs.Service
+}
+
+func NewTaskHandler(deviceSvc devices.Service, jobSvc jobs.Service) *TaskHandler {
+	return &TaskHandler{
+		deviceSvc: deviceSvc,
+		jobSvc:    jobSvc,
+	}
 }
 
 type PreferenceRequest struct {
@@ -52,7 +63,7 @@ type JobResponse struct {
 	CompletedAt    *string `json:"completed_at,omitempty"`
 }
 
-func PutDevicePreference(w http.ResponseWriter, r *http.Request) {
+func (h *TaskHandler) PutDevicePreference(w http.ResponseWriter, r *http.Request) {
 	deviceID := r.PathValue("device_id")
 	if deviceID == "" {
 		http.Error(w, "device_id is required", http.StatusBadRequest)
@@ -65,43 +76,10 @@ func PutDevicePreference(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	db := database.GetDB()
-
-	var device models.Device
-	err := db.Where("device_id = ?", deviceID).First(&device).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		device = models.Device{
-			DeviceID:   deviceID,
-			Role:       req.Role,
-			Preference: req.Preference,
-			LastSeen:   time.Now(),
-			CreatedAt:  time.Now(),
-		}
-		if err := db.Create(&device).Error; err != nil {
-			http.Error(w, "failed to create device", http.StatusInternalServerError)
-			return
-		}
-	} else if err != nil {
-		http.Error(w, "failed to load device", http.StatusInternalServerError)
-		return
-	} else {
-		updates := map[string]any{}
-		if req.Role != "" {
-			updates["role"] = req.Role
-		}
-		if req.Preference != "" {
-			updates["preference"] = req.Preference
-		}
-		if len(updates) > 0 {
-			if err := db.Model(&device).Updates(updates).Error; err != nil {
-				http.Error(w, "failed to update preference", http.StatusInternalServerError)
-				return
-			}
-		}
-	}
-
-	if err := db.Where("device_id = ?", deviceID).First(&device).Error; err != nil {
-		http.Error(w, "failed to reload device", http.StatusInternalServerError)
+	ctx := r.Context()
+	device, err := h.deviceSvc.UpdatePreference(ctx, deviceID, req.Role, req.Preference)
+	if err != nil {
+		http.Error(w, "failed to update preference", http.StatusInternalServerError)
 		return
 	}
 
@@ -115,7 +93,7 @@ func PutDevicePreference(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-func PostDeviceJob(w http.ResponseWriter, r *http.Request) {
+func (h *TaskHandler) PostDeviceJob(w http.ResponseWriter, r *http.Request) {
 	if defaultRunner == nil {
 		http.Error(w, "pipeline runner not initialized", http.StatusInternalServerError)
 		return
@@ -149,57 +127,47 @@ func PostDeviceJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	input := steps.RSSJobInput{
-		DeviceID:       deviceID,
-		TimeRangeStart: timeStart,
-		TimeRangeEnd:   timeEnd,
-	}
-	inputJSON, err := json.Marshal(input)
-	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-
-	job, err := defaultRunner.Submit(context.Background(), steps.PipelineName, inputJSON)
+	ctx := r.Context()
+	job, err := h.jobSvc.CreateJob(ctx, deviceID, timeStart, timeEnd)
 	if err != nil {
 		http.Error(w, "failed to start pipeline job", http.StatusInternalServerError)
 		return
 	}
 
-	// Associate device with the job record.
-	db := database.GetDB()
-	db.Model(&models.Job{}).Where("id = ?", job.ID).
-		Updates(map[string]any{"device_id": deviceID, "updated_at": time.Now()})
-
-	resp := jobRecordToResponse(job, deviceID, timeStart, timeEnd)
+	input := steps.RSSJobInput{
+		DeviceID:       deviceID,
+		TimeRangeStart: timeStart,
+		TimeRangeEnd:   timeEnd,
+	}
+	resp := jobModelToResponse(job, deviceID, input)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(resp)
 }
 
-func GetDeviceJob(w http.ResponseWriter, r *http.Request) {
+func (h *TaskHandler) GetDeviceJob(w http.ResponseWriter, r *http.Request) {
 	deviceID := r.PathValue("device_id")
 	if deviceID == "" {
 		http.Error(w, "device_id is required", http.StatusBadRequest)
 		return
 	}
 
-	db := database.GetDB()
-	var job models.Job
-	if err := db.Where("device_id = ?", deviceID).Order("created_at DESC, id DESC").First(&job).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			http.Error(w, "no jobs found", http.StatusNotFound)
-			return
-		}
+	ctx := r.Context()
+	job, err := h.jobSvc.GetLatestJob(ctx, deviceID)
+	if errors.Is(err, items.ErrNotFound) {
+		http.Error(w, "no jobs found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
 		http.Error(w, "failed to load job", http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(jobModelToResponse(&job))
+	json.NewEncoder(w).Encode(jobToResponse(job))
 }
 
-func GetDeviceJobByID(w http.ResponseWriter, r *http.Request) {
+func (h *TaskHandler) GetDeviceJobByID(w http.ResponseWriter, r *http.Request) {
 	deviceID := r.PathValue("device_id")
 	jobIDStr := r.PathValue("job_id")
 	if deviceID == "" {
@@ -213,31 +181,29 @@ func GetDeviceJobByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	db := database.GetDB()
-	var job models.Job
-	if err := db.Where("id = ? AND device_id = ?", jobID, deviceID).First(&job).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			http.Error(w, "job not found", http.StatusNotFound)
-			return
-		}
+	ctx := r.Context()
+	job, err := h.jobSvc.GetJobByID(ctx, jobID, deviceID)
+	if errors.Is(err, items.ErrNotFound) {
+		http.Error(w, "job not found", http.StatusNotFound)
+		return
+	}
+	if err != nil {
 		http.Error(w, "failed to load job", http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(jobModelToResponse(&job))
+	json.NewEncoder(w).Encode(jobToResponse(job))
 }
 
-// jobModelToResponse converts a models.Job row to a JobResponse.
-// It parses the Input JSON to extract the original time range.
-func jobModelToResponse(job *models.Job) JobResponse {
+func jobToResponse(job *models.Job) JobResponse {
 	resp := JobResponse{
 		ID:          job.ID,
 		DeviceID:    job.DeviceID,
 		Status:      job.Status,
 		CurrentStep: job.CurrentStep,
 		Level2IDs:   job.Level2IDs,
-		Report:      job.Report,
+		Report:       job.Report,
 		Error:       job.Error,
 		CreatedAt:   job.CreatedAt.Format(time.RFC3339),
 	}
@@ -246,7 +212,6 @@ func jobModelToResponse(job *models.Job) JobResponse {
 		resp.CompletedAt = &s
 	}
 
-	// Parse time range from the stored Input JSON.
 	var input steps.RSSJobInput
 	if err := json.Unmarshal([]byte(job.Input), &input); err == nil {
 		if !input.TimeRangeStart.IsZero() {
@@ -261,17 +226,15 @@ func jobModelToResponse(job *models.Job) JobResponse {
 	return resp
 }
 
-// jobRecordToResponse builds a JobResponse directly from the freshly-created JobRecord
-// (before any DB round-trip is needed for time range data).
-func jobRecordToResponse(job *pipeline.JobRecord, deviceID string, timeStart, timeEnd time.Time) JobResponse {
+func jobModelToResponse(job *models.Job, deviceID string, input steps.RSSJobInput) JobResponse {
 	resp := JobResponse{
 		ID:       job.ID,
 		DeviceID: deviceID,
-		Status:   string(job.Status),
+		Status:   job.Status,
 		Error:    job.Error,
 	}
-	s := timeStart.Format(time.RFC3339)
-	e := timeEnd.Format(time.RFC3339)
+	s := input.TimeRangeStart.Format(time.RFC3339)
+	e := input.TimeRangeEnd.Format(time.RFC3339)
 	resp.TimeRangeStart = &s
 	resp.TimeRangeEnd = &e
 	resp.CreatedAt = job.CreatedAt.Format(time.RFC3339)

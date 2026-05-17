@@ -5,22 +5,21 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/esp32-rss-display/backend/server/models"
 	"github.com/esp32-rss-display/backend/server/pipeline"
-	"gorm.io/gorm"
 )
 
 // FilterL2Step applies a second, richer filter using item abstracts, narrowing the
 // candidate set to items most relevant to the device owner's preferences.
 // It writes the selected IDs to state under "filter_l2".
 type FilterL2Step struct {
-	db     *gorm.DB
-	runner *pipeline.PythonRunner
+	devices DeviceGetter
+	items   ItemFinder
+	runner  *pipeline.PythonRunner
 }
 
 // NewFilterL2Step constructs a FilterL2Step.
-func NewFilterL2Step(db *gorm.DB, runner *pipeline.PythonRunner) *FilterL2Step {
-	return &FilterL2Step{db: db, runner: runner}
+func NewFilterL2Step(devices DeviceGetter, items ItemFinder, runner *pipeline.PythonRunner) *FilterL2Step {
+	return &FilterL2Step{devices: devices, items: items, runner: runner}
 }
 
 func (s *FilterL2Step) Name() string { return "filter_l2" }
@@ -47,14 +46,29 @@ func (s *FilterL2Step) Run(ctx context.Context, state pipeline.StateAccessor) er
 		return pipeline.SetState(state, s.Name(), FilterL2Output{Level2IDs: nil})
 	}
 
-	device, err := getDevice(s.db, input.DeviceID)
+	device, err := s.devices.GetOrCreate(ctx, input.DeviceID)
 	if err != nil {
 		return fmt.Errorf("filter_l2: get device: %w", err)
 	}
 
-	var items []models.Item
-	if err := s.db.Where("id IN ? AND abstract != ''", summarize.SummarizedIDs).Find(&items).Error; err != nil {
+	itemList, err := s.items.FindByIDs(ctx, summarize.SummarizedIDs)
+	if err != nil {
 		return fmt.Errorf("filter_l2: get items: %w", err)
+	}
+
+	var filteredItems []struct {
+		ID       uint
+		Title    string
+		Abstract string
+	}
+	for _, item := range itemList {
+		if item.Abstract != "" {
+			filteredItems = append(filteredItems, struct {
+				ID       uint
+				Title    string
+				Abstract string
+			}{ID: item.ID, Title: item.Title, Abstract: item.Abstract})
+		}
 	}
 
 	type itemEntry struct {
@@ -62,8 +76,8 @@ func (s *FilterL2Step) Run(ctx context.Context, state pipeline.StateAccessor) er
 		Title    string `json:"title"`
 		Abstract string `json:"abstract"`
 	}
-	entries := make([]itemEntry, len(items))
-	for i, item := range items {
+	entries := make([]itemEntry, len(filteredItems))
+	for i, item := range filteredItems {
 		entries[i] = itemEntry{ID: item.ID, Title: item.Title, Abstract: item.Abstract}
 	}
 

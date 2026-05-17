@@ -5,27 +5,27 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/esp32-rss-display/backend/server/models"
 	"github.com/esp32-rss-display/backend/server/pipeline"
-	"gorm.io/gorm"
 )
 
 // CrawlStep fetches the article content for each Level-1 item and persists it
 // to the database. It writes the list of attempted IDs to state under "crawl".
 type CrawlStep struct {
-	db                  *gorm.DB
-	runner              *pipeline.PythonRunner
+	items  ItemFinder
+	update ItemUpdater
+	runner *pipeline.PythonRunner
 	rateLimitMinSeconds int
 	rateLimitMaxSeconds int
 }
 
 // NewCrawlStep constructs a CrawlStep.
-func NewCrawlStep(db *gorm.DB, runner *pipeline.PythonRunner, rateLimitMin, rateLimitMax int) *CrawlStep {
+func NewCrawlStep(items ItemFinder, update ItemUpdater, runner *pipeline.PythonRunner, rateLimitMin, rateLimitMax int) *CrawlStep {
 	return &CrawlStep{
-		db:                  db,
-		runner:              runner,
-		rateLimitMinSeconds: rateLimitMin,
-		rateLimitMaxSeconds: rateLimitMax,
+		items:                items,
+		update:               update,
+		runner:               runner,
+		rateLimitMinSeconds:  rateLimitMin,
+		rateLimitMaxSeconds:  rateLimitMax,
 	}
 }
 
@@ -48,8 +48,8 @@ func (s *CrawlStep) Run(ctx context.Context, state pipeline.StateAccessor) error
 		return pipeline.SetState(state, s.Name(), CrawlOutput{CrawledIDs: nil})
 	}
 
-	var items []models.Item
-	if err := s.db.Where("id IN ?", l1.Level1IDs).Find(&items).Error; err != nil {
+	itemList, err := s.items.FindByIDs(ctx, l1.Level1IDs)
+	if err != nil {
 		return fmt.Errorf("crawl: get items: %w", err)
 	}
 
@@ -57,8 +57,8 @@ func (s *CrawlStep) Run(ctx context.Context, state pipeline.StateAccessor) error
 		ID  uint   `json:"id"`
 		URL string `json:"url"`
 	}
-	entries := make([]itemEntry, len(items))
-	for i, item := range items {
+	entries := make([]itemEntry, len(itemList))
+	for i, item := range itemList {
 		entries[i] = itemEntry{ID: item.ID, URL: item.URL}
 	}
 
@@ -93,8 +93,7 @@ func (s *CrawlStep) Run(ctx context.Context, state pipeline.StateAccessor) error
 	var crawledIDs []uint
 	for _, r := range pyOutput.Results {
 		if r.Success && r.Content != "" {
-			if err := s.db.Model(&models.Item{}).Where("id = ?", r.ID).
-				Update("content", r.Content).Error; err != nil {
+			if err := s.update.UpdateContent(ctx, r.ID, r.Content); err != nil {
 				return fmt.Errorf("crawl: update item %d: %w", r.ID, err)
 			}
 		}

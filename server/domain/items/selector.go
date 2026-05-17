@@ -7,55 +7,46 @@ import (
 	"time"
 
 	"github.com/esp32-rss-display/backend/server/models"
-	"gorm.io/gorm"
 )
 
 const PlaceholderItemID uint = 0
-const PlaceholderTitle = "正在同步内容，请稍后刷新"
+const PlaceholderTitle = "Working on it..."
 
-// PlaceholderItem is returned when no real items are available.
 var PlaceholderItem = &models.Item{
 	ID:    PlaceholderItemID,
 	Title: PlaceholderTitle,
 }
 
-// ItemSelector selects the next item to display for a device.
 type ItemSelector interface {
-	Select(ctx context.Context, db *gorm.DB, device models.Device) (*models.Item, error)
+	Select(ctx context.Context, device models.Device) (*models.Item, error)
 }
 
-// WeightedItemSelector selects items using a recency-biased weighted random strategy.
 type WeightedItemSelector struct {
+	repo        Repository
 	now         func() time.Time
 	randFloat64 func() float64
 }
 
-// NewWeightedItemSelector creates a production-ready selector seeded from system time.
-func NewWeightedItemSelector() *WeightedItemSelector {
+func NewWeightedItemSelector(repo Repository) *WeightedItemSelector {
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	return &WeightedItemSelector{
+		repo:        repo,
 		now:         time.Now,
 		randFloat64: rng.Float64,
 	}
 }
 
-// NewSeededItemSelector creates a deterministic selector useful for testing.
-func NewSeededItemSelector(now time.Time, seed int64) *WeightedItemSelector {
+func NewSeededItemSelector(repo Repository, now time.Time, seed int64) *WeightedItemSelector {
 	rng := rand.New(rand.NewSource(seed))
 	return &WeightedItemSelector{
+		repo:        repo,
 		now:         func() time.Time { return now },
 		randFloat64: rng.Float64,
 	}
 }
 
-// Select returns the next item to display, biased toward recent items.
-func (s *WeightedItemSelector) Select(ctx context.Context, db *gorm.DB, device models.Device) (*models.Item, error) {
-	var allItems []models.Item
-	err := db.WithContext(ctx).
-		Joins("JOIN feeds ON feeds.id = items.feed_id").
-		Where("feeds.enabled = ?", true).
-		Order("COALESCE(items.published_at, items.created_at) DESC, items.id DESC").
-		Find(&allItems).Error
+func (s *WeightedItemSelector) Select(ctx context.Context, device models.Device) (*models.Item, error) {
+	allItems, err := s.repo.ListEnabled(ctx)
 	if err != nil {
 		return nil, err
 	}

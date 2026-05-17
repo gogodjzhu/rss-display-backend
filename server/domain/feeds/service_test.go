@@ -28,13 +28,13 @@ func newTestDB(t *testing.T) *gorm.DB {
 
 func TestInitFeedsCreatesMissingFeeds(t *testing.T) {
 	db := newTestDB(t)
-	svc := feeds.NewService(feeds.NewGORMRepository())
+	svc := feeds.NewService(feeds.NewGORMRepository(db))
 
 	configs := []config.FeedConfig{
 		{Name: "Feed A", URL: "http://a.example.com/rss", Enabled: true},
 		{Name: "Feed B", URL: "http://b.example.com/rss", Enabled: true},
 	}
-	if err := svc.InitFeeds(context.Background(), db, configs); err != nil {
+	if err := svc.InitFeeds(context.Background(), configs); err != nil {
 		t.Fatalf("InitFeeds: %v", err)
 	}
 
@@ -47,7 +47,7 @@ func TestInitFeedsCreatesMissingFeeds(t *testing.T) {
 
 func TestInitFeedsUpdatesExistingFeed(t *testing.T) {
 	db := newTestDB(t)
-	svc := feeds.NewService(feeds.NewGORMRepository())
+	svc := feeds.NewService(feeds.NewGORMRepository(db))
 
 	existing := models.Feed{Name: "Old Name", URL: "http://a.example.com/rss", Enabled: false}
 	db.Create(&existing)
@@ -55,7 +55,7 @@ func TestInitFeedsUpdatesExistingFeed(t *testing.T) {
 	configs := []config.FeedConfig{
 		{Name: "New Name", URL: "http://a.example.com/rss", Enabled: true},
 	}
-	if err := svc.InitFeeds(context.Background(), db, configs); err != nil {
+	if err := svc.InitFeeds(context.Background(), configs); err != nil {
 		t.Fatalf("InitFeeds: %v", err)
 	}
 
@@ -71,13 +71,12 @@ func TestInitFeedsUpdatesExistingFeed(t *testing.T) {
 
 func TestInitFeedsDisablesStaleFeeds(t *testing.T) {
 	db := newTestDB(t)
-	svc := feeds.NewService(feeds.NewGORMRepository())
+	svc := feeds.NewService(feeds.NewGORMRepository(db))
 
 	stale := models.Feed{Name: "Stale", URL: "http://stale.example.com/rss", Enabled: true}
 	db.Create(&stale)
 
-	// No configs — stale should be disabled.
-	if err := svc.InitFeeds(context.Background(), db, nil); err != nil {
+	if err := svc.InitFeeds(context.Background(), nil); err != nil {
 		t.Fatalf("InitFeeds: %v", err)
 	}
 
@@ -90,13 +89,13 @@ func TestInitFeedsDisablesStaleFeeds(t *testing.T) {
 
 func TestInitFeedsIdempotent(t *testing.T) {
 	db := newTestDB(t)
-	svc := feeds.NewService(feeds.NewGORMRepository())
+	svc := feeds.NewService(feeds.NewGORMRepository(db))
 
 	configs := []config.FeedConfig{
 		{Name: "Feed A", URL: "http://a.example.com/rss", Enabled: true},
 	}
 	for range 3 {
-		if err := svc.InitFeeds(context.Background(), db, configs); err != nil {
+		if err := svc.InitFeeds(context.Background(), configs); err != nil {
 			t.Fatalf("InitFeeds: %v", err)
 		}
 	}

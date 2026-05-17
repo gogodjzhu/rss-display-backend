@@ -28,9 +28,9 @@ func newTestDB(t *testing.T) *gorm.DB {
 
 func TestGetOrCreateCreatesNewDevice(t *testing.T) {
 	db := newTestDB(t)
-	svc := devices.NewService(devices.NewGORMRepository())
+	svc := devices.NewService(devices.NewGORMRepository(db))
 
-	device, err := svc.GetOrCreate(context.Background(), db, "dev-1")
+	device, err := svc.GetOrCreate(context.Background(), "dev-1")
 	if err != nil {
 		t.Fatalf("GetOrCreate: %v", err)
 	}
@@ -41,13 +41,13 @@ func TestGetOrCreateCreatesNewDevice(t *testing.T) {
 
 func TestGetOrCreateReturnsExisting(t *testing.T) {
 	db := newTestDB(t)
-	svc := devices.NewService(devices.NewGORMRepository())
+	svc := devices.NewService(devices.NewGORMRepository(db))
 
 	now := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
 	existing := models.Device{DeviceID: "dev-2", CreatedAt: now, LastSeen: now}
 	db.Create(&existing)
 
-	device, err := svc.GetOrCreate(context.Background(), db, "dev-2")
+	device, err := svc.GetOrCreate(context.Background(), "dev-2")
 	if err != nil {
 		t.Fatalf("GetOrCreate: %v", err)
 	}
@@ -63,12 +63,12 @@ func TestGetOrCreateReturnsExisting(t *testing.T) {
 
 func TestUpdatePreferenceSetsFields(t *testing.T) {
 	db := newTestDB(t)
-	svc := devices.NewService(devices.NewGORMRepository())
+	svc := devices.NewService(devices.NewGORMRepository(db))
 
 	existing := models.Device{DeviceID: "dev-3", CreatedAt: time.Now(), LastSeen: time.Now()}
 	db.Create(&existing)
 
-	updated, err := svc.UpdatePreference(context.Background(), db, "dev-3", "news", "compact")
+	updated, err := svc.UpdatePreference(context.Background(), "dev-3", "news", "compact")
 	if err != nil {
 		t.Fatalf("UpdatePreference: %v", err)
 	}
@@ -82,9 +82,9 @@ func TestUpdatePreferenceSetsFields(t *testing.T) {
 
 func TestUpdatePreferenceCreatesDevice(t *testing.T) {
 	db := newTestDB(t)
-	svc := devices.NewService(devices.NewGORMRepository())
+	svc := devices.NewService(devices.NewGORMRepository(db))
 
-	device, err := svc.UpdatePreference(context.Background(), db, "brand-new", "tech", "full")
+	device, err := svc.UpdatePreference(context.Background(), "brand-new", "tech", "full")
 	if err != nil {
 		t.Fatalf("UpdatePreference: %v", err)
 	}

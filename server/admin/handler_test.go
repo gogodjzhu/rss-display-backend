@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/esp32-rss-display/backend/server/database"
+	admindomain "github.com/esp32-rss-display/backend/server/domain/admin"
 	"github.com/esp32-rss-display/backend/server/models"
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
@@ -20,7 +20,7 @@ import (
 func TestDashboardRendersSummarySections(t *testing.T) {
 	db := newTestDB(t)
 	seedAdminData(t, db)
-	handler := NewHandler()
+	handler := NewHandler(admindomain.NewGORMReadModel(db))
 
 	req := httptest.NewRequest(http.MethodGet, "/admin", nil)
 	rr := httptest.NewRecorder()
@@ -41,7 +41,7 @@ func TestDashboardRendersSummarySections(t *testing.T) {
 func TestAdminDetailPagesRenderExistingRecords(t *testing.T) {
 	db := newTestDB(t)
 	seed := seedAdminData(t, db)
-	handler := NewHandler()
+	handler := NewHandler(admindomain.NewGORMReadModel(db))
 
 	tests := []struct {
 		name    string
@@ -101,8 +101,8 @@ func TestAdminDetailPagesRenderExistingRecords(t *testing.T) {
 }
 
 func TestAdminDetailPagesReturnNotFoundForMissingRecords(t *testing.T) {
-	_ = newTestDB(t)
-	handler := NewHandler()
+	db := newTestDB(t)
+	handler := NewHandler(admindomain.NewGORMReadModel(db))
 
 	tests := []struct {
 		name   string
@@ -133,7 +133,7 @@ func TestAdminDetailPagesReturnNotFoundForMissingRecords(t *testing.T) {
 func TestAdminListPagesArePaginated(t *testing.T) {
 	db := newTestDB(t)
 	seedAdminListData(t, db, 25)
-	handler := NewHandler()
+	handler := NewHandler(admindomain.NewGORMReadModel(db))
 
 	tests := []struct {
 		name   string
@@ -176,7 +176,7 @@ func TestAdminListPagesArePaginated(t *testing.T) {
 func TestFeedDetailItemsArePaginated(t *testing.T) {
 	db := newTestDB(t)
 	feed := seedAdminFeedDetailData(t, db, 25)
-	handler := NewHandler()
+	handler := NewHandler(admindomain.NewGORMReadModel(db))
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/feeds/"+uintToString(feed.ID)+"?page=2", nil)
 	req.SetPathValue("id", uintToString(feed.ID))
@@ -199,7 +199,7 @@ func TestFeedDetailItemsArePaginated(t *testing.T) {
 func TestItemsListFiltersAndSorts(t *testing.T) {
 	db := newTestDB(t)
 	seedAdminFilterData(t, db)
-	handler := NewHandler()
+	handler := NewHandler(admindomain.NewGORMReadModel(db))
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/items?title=Beta&feed_id=2&from=2026-05-02&to=2026-05-03&sort=shows_desc", nil)
 	rr := httptest.NewRecorder()
@@ -223,7 +223,7 @@ func TestItemsListFiltersAndSorts(t *testing.T) {
 func TestItemsListSortsByShowsDescending(t *testing.T) {
 	db := newTestDB(t)
 	seedAdminFilterData(t, db)
-	handler := NewHandler()
+	handler := NewHandler(admindomain.NewGORMReadModel(db))
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/items?sort=shows_desc", nil)
 	rr := httptest.NewRecorder()
@@ -416,7 +416,6 @@ func newTestDB(t *testing.T) *gorm.DB {
 		t.Fatalf("failed to migrate test db: %v", err)
 	}
 
-	database.DB = db
 	return db
 }
 

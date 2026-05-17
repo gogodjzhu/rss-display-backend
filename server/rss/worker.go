@@ -1,7 +1,7 @@
 package rssworker
 
 import (
-	"errors"
+	"context"
 	"net/http"
 	"net/url"
 	"strings"
@@ -9,13 +9,12 @@ import (
 	"time"
 
 	"github.com/esp32-rss-display/backend/server/config"
-	"github.com/esp32-rss-display/backend/server/database"
+	"github.com/esp32-rss-display/backend/server/domain/feeds"
 	"github.com/esp32-rss-display/backend/server/domain/items"
 	"github.com/esp32-rss-display/backend/server/logger"
 	"github.com/esp32-rss-display/backend/server/metrics"
 	"github.com/esp32-rss-display/backend/server/models"
 	"github.com/mmcdole/gofeed"
-	"gorm.io/gorm"
 )
 
 var rssLog = logger.Get("rss")
@@ -24,11 +23,13 @@ type Worker struct {
 	fetchInterval time.Duration
 	httpClient    *http.Client
 	extractor     *items.ImageExtractor
-	stopCh        chan struct{}
+	feedSvc      feeds.Service
+	itemSvc      items.Service
+	stopCh       chan struct{}
 	refreshing    atomic.Bool
 }
 
-func New(cfg *config.RSSConfig) *Worker {
+func New(cfg *config.RSSConfig, feedSvc feeds.Service, itemSvc items.Service) *Worker {
 	feedTimeout := time.Duration(cfg.FeedFetchTimeoutSeconds) * time.Second
 	if feedTimeout <= 0 {
 		feedTimeout = 10 * time.Second
@@ -38,7 +39,9 @@ func New(cfg *config.RSSConfig) *Worker {
 		fetchInterval: time.Duration(cfg.FetchIntervalMinutes) * time.Minute,
 		httpClient:    &http.Client{Timeout: feedTimeout},
 		extractor:     items.NewImageExtractor(),
-		stopCh:        make(chan struct{}),
+		feedSvc:      feedSvc,
+		itemSvc:      itemSvc,
+		stopCh:       make(chan struct{}),
 	}
 }
 
@@ -73,19 +76,18 @@ func (w *Worker) fetchAllFeeds() {
 	}
 	defer w.refreshing.Store(false)
 
-	db := database.GetDB()
-	var feeds []models.Feed
-
-	if err := db.Where("enabled = ?", true).Find(&feeds).Error; err != nil {
+	ctx := context.Background()
+	feedList, err := w.feedSvc.ListEnabled(ctx)
+	if err != nil {
 		rssLog.Printf("failed to load enabled feeds: %v", err)
 		metrics.RSSFetchError.Add(1)
 		return
 	}
 
 	startedAt := time.Now()
-	rssLog.Printf("refreshing %d enabled feeds", len(feeds))
+	rssLog.Printf("refreshing %d enabled feeds", len(feedList))
 
-	for _, feed := range feeds {
+	for _, feed := range feedList {
 		w.fetchFeed(feed)
 	}
 
@@ -106,7 +108,7 @@ func (w *Worker) fetchFeed(feed models.Feed) {
 		return
 	}
 
-	db := database.GetDB()
+	ctx := context.Background()
 	newItems := 0
 
 	for _, item := range parsed.Items {
@@ -114,14 +116,6 @@ func (w *Worker) fetchFeed(feed models.Feed) {
 		itemURL := normalizeItemURL(item.Link)
 
 		if itemURL == "" {
-			continue
-		}
-
-		var existingItem models.Item
-		if err := db.Where("feed_id = ? AND url = ?", feed.ID, itemURL).First(&existingItem).Error; err == nil {
-			continue
-		} else if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-			rssLog.Printf("failed to check existing item %q: %v", title, err)
 			continue
 		}
 
@@ -133,7 +127,7 @@ func (w *Worker) fetchFeed(feed models.Feed) {
 
 		imageURL := w.extractor.Extract(item)
 
-		newItem := models.Item{
+		newItem := &models.Item{
 			FeedID:      feed.ID,
 			Title:       title,
 			URL:         itemURL,
@@ -141,16 +135,17 @@ func (w *Worker) fetchFeed(feed models.Feed) {
 			PublishedAt: publishedAt,
 		}
 
-		if err := db.Create(&newItem).Error; err != nil {
-			if isDuplicateItemError(err) {
-				continue
+		created, err := w.itemSvc.CreateIfNew(ctx, newItem)
+		if err != nil {
+			if !isDuplicateItemError(err) {
+				rssLog.Printf("failed to save item %q: %v", title, err)
 			}
-			rssLog.Printf("failed to save item %q: %v", title, err)
 			continue
 		}
-
-		metrics.RSSItemsParsedTotal.Add(1)
-		newItems++
+		if created {
+			metrics.RSSItemsParsedTotal.Add(1)
+			newItems++
+		}
 	}
 
 	rssLog.Printf("feed %q refreshed: %d items fetched, %d new, took %s", feed.Name, len(parsed.Items), newItems, time.Since(startedAt).Round(time.Millisecond))
