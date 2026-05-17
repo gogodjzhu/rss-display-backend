@@ -26,11 +26,11 @@ type ServerConfig struct {
 }
 
 type RSSConfig struct {
-	FetchIntervalMinutes int `yaml:"fetch_interval_minutes"`
-	ImageWidth           int `yaml:"image_width"`
-	ImageHeight          int `yaml:"image_height"`
+	FetchIntervalMinutes        int `yaml:"fetch_interval_minutes"`
+	ImageWidth                  int `yaml:"image_width"`
+	ImageHeight                 int `yaml:"image_height"`
 	ImageDownloadTimeoutSeconds int `yaml:"image_download_timeout_seconds"`
-	FeedFetchTimeoutSeconds int `yaml:"feed_fetch_timeout_seconds"`
+	FeedFetchTimeoutSeconds     int `yaml:"feed_fetch_timeout_seconds"`
 }
 
 type FeedConfig struct {
@@ -40,9 +40,12 @@ type FeedConfig struct {
 }
 
 type PipelineConfig struct {
-	PythonPath          string `yaml:"python_path"`
-	ScriptPath          string `yaml:"script_path"`
-	DataDir             string `yaml:"data_dir"`
+	PythonPath string `yaml:"python_path"`
+	ScriptPath string `yaml:"script_path"`
+	DataDir    string `yaml:"data_dir"`
+	// StateDir is where the FileStateManager persists per-job step state.
+	// Defaults to <DataDir>/state when empty.
+	StateDir            string `yaml:"state_dir"`
 	RateLimitMinSeconds int    `yaml:"rate_limit_min_seconds"`
 	RateLimitMaxSeconds int    `yaml:"rate_limit_max_seconds"`
 }

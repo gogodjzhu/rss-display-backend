@@ -1,12 +1,17 @@
 package pipeline
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"time"
+
+	"github.com/esp32-rss-display/backend/server/logger"
 )
+
+var pipelineLog = logger.Get("pipeline")
 
 type PythonRunner struct {
 	PythonPath string
@@ -71,9 +76,16 @@ func (r *PythonRunner) ReadJSON(path string, target any) error {
 	return nil
 }
 
+// Run executes the Python pipeline script with the given mode and I/O file paths.
+// Deprecated: prefer RunCtx for context cancellation support.
 func (r *PythonRunner) Run(mode, inputPath, outputPath string) error {
+	return r.RunCtx(context.Background(), mode, inputPath, outputPath)
+}
+
+// RunCtx executes the Python pipeline script, honouring ctx for cancellation and timeout.
+func (r *PythonRunner) RunCtx(ctx context.Context, mode, inputPath, outputPath string) error {
 	start := time.Now()
-	cmd := exec.Command(r.PythonPath, r.ScriptPath,
+	cmd := exec.CommandContext(ctx, r.PythonPath, r.ScriptPath,
 		"--mode", mode,
 		"--input", inputPath,
 		"--output", outputPath,

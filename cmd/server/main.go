@@ -1,21 +1,24 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/esp32-rss-display/backend/server/admin"
 	"github.com/esp32-rss-display/backend/server/api"
 	"github.com/esp32-rss-display/backend/server/config"
 	"github.com/esp32-rss-display/backend/server/database"
+	"github.com/esp32-rss-display/backend/server/domain/feeds"
 	"github.com/esp32-rss-display/backend/server/image"
 	"github.com/esp32-rss-display/backend/server/logger"
-	"github.com/esp32-rss-display/backend/server/models"
 	"github.com/esp32-rss-display/backend/server/pipeline"
+	"github.com/esp32-rss-display/backend/server/pipeline/steps"
 	rssworker "github.com/esp32-rss-display/backend/server/rss"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/spf13/cobra"
@@ -55,13 +58,36 @@ func runServer(cmd *cobra.Command, args []string) {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
 
-	initFeeds(cfg.Feeds)
-
-	pipe := pipeline.NewPipeline(cfg.Pipeline)
-	if err := pipe.Init(); err != nil {
-		log.Fatalf("Failed to initialize pipeline: %v", err)
+	feedSvc := feeds.NewService(feeds.NewGORMRepository())
+	db := database.GetDB()
+	if err := feedSvc.InitFeeds(context.Background(), db, cfg.Feeds); err != nil {
+		log.Fatalf("Failed to initialise feeds: %v", err)
 	}
-	api.InitPipeline(pipe)
+
+	// Build the pipeline runner.
+	stateDir := cfg.Pipeline.StateDir
+	if stateDir == "" {
+		stateDir = filepath.Join(cfg.Pipeline.DataDir, "state")
+	}
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		log.Fatalf("Failed to create pipeline state dir: %v", err)
+	}
+	pythonRunner := &pipeline.PythonRunner{
+		PythonPath: cfg.Pipeline.PythonPath,
+		ScriptPath: cfg.Pipeline.ScriptPath,
+		DataDir:    cfg.Pipeline.DataDir,
+	}
+	jobStore := database.NewGORMJobStore(db)
+	stateManager := pipeline.NewFileStateManager(stateDir)
+	runner := pipeline.NewRunner(jobStore, stateManager, log.Default())
+	rssPipeline := steps.BuildRSSPipeline(db, pythonRunner, cfg.Pipeline.RateLimitMinSeconds, cfg.Pipeline.RateLimitMaxSeconds)
+	if err := runner.Register(rssPipeline); err != nil {
+		log.Fatalf("Failed to register RSS pipeline: %v", err)
+	}
+	if err := runner.Recover(context.Background()); err != nil {
+		log.Fatalf("Failed to recover pending pipeline jobs: %v", err)
+	}
+	api.InitRunner(runner)
 
 	mux := http.NewServeMux()
 
@@ -70,9 +96,9 @@ func runServer(cmd *cobra.Command, args []string) {
 	mux.HandleFunc("GET /v1/device/{device_id}/next", api.GetNextItem)
 	mux.HandleFunc("POST /v1/item/{item_id}/rating", api.PostItemRating)
 	mux.HandleFunc("PUT /v1/device/{device_id}/preference", api.PutDevicePreference)
-	mux.HandleFunc("POST /v1/device/{device_id}/task", api.PostDeviceTask)
-	mux.HandleFunc("GET /v1/device/{device_id}/task", api.GetDeviceTask)
-	mux.HandleFunc("GET /v1/device/{device_id}/task/{task_id}", api.GetDeviceTaskByID)
+	mux.HandleFunc("POST /v1/device/{device_id}/job", api.PostDeviceJob)
+	mux.HandleFunc("GET /v1/device/{device_id}/job", api.GetDeviceJob)
+	mux.HandleFunc("GET /v1/device/{device_id}/job/{job_id}", api.GetDeviceJobByID)
 	image.Mount(mux, &cfg.RSS)
 	mux.HandleFunc("GET /nfc/{device_id}", api.NFCRedirect)
 
@@ -94,47 +120,4 @@ func runServer(cmd *cobra.Command, args []string) {
 
 	worker.Stop()
 	logger.Get("server").Println("Server stopped")
-}
-
-func initFeeds(feeds []config.FeedConfig) {
-	db := database.GetDB()
-	configuredURLs := make(map[string]struct{}, len(feeds))
-
-	logFeed := logger.Get("feed")
-	for _, f := range feeds {
-		configuredURLs[f.URL] = struct{}{}
-
-		var existing models.Feed
-		if err := db.Where("url = ?", f.URL).First(&existing).Error; err != nil {
-			db.Create(&models.Feed{
-				Name:    f.Name,
-				URL:     f.URL,
-				Enabled: f.Enabled,
-			})
-		} else {
-			db.Model(&existing).Updates(models.Feed{Name: f.Name, Enabled: f.Enabled})
-		}
-	}
-
-	var existingFeeds []models.Feed
-	if err := db.Find(&existingFeeds).Error; err != nil {
-		logFeed.Printf("Failed to list existing feeds: %v", err)
-		return
-	}
-
-	for _, feed := range existingFeeds {
-		if _, ok := configuredURLs[feed.URL]; ok {
-			continue
-		}
-		if !feed.Enabled {
-			continue
-		}
-
-		if err := db.Model(&feed).Update("enabled", false).Error; err != nil {
-			logFeed.Printf("Failed to disable stale feed %q (%s): %v", feed.Name, feed.URL, err)
-			continue
-		}
-
-		logFeed.Printf("Disabled stale feed %q (%s) not present in config", feed.Name, feed.URL)
-	}
 }

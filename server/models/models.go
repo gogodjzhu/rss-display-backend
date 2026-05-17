@@ -97,3 +97,24 @@ type Task struct {
 func (Task) TableName() string {
 	return "tasks"
 }
+
+// Job records a pipeline execution driven by the Runner.
+// Replaces Task for new pipeline submissions.
+type Job struct {
+	ID           uint       `gorm:"primaryKey" json:"id"`
+	PipelineName string     `gorm:"column:pipeline_name;index" json:"pipeline_name"`
+	DeviceID     string     `gorm:"column:device_id;index" json:"device_id"`
+	Status       string     `gorm:"column:status;index" json:"status"`
+	CurrentStep  int        `gorm:"column:current_step" json:"current_step"`
+	Input        string     `gorm:"column:input;type:text" json:"input"`
+	Error        string     `gorm:"column:error;type:text" json:"error"`
+	Level2IDs    string     `gorm:"column:level2_ids;type:text" json:"level2_ids"`
+	Report       string     `gorm:"column:report;type:longtext" json:"report"`
+	CreatedAt    time.Time  `gorm:"column:created_at" json:"created_at"`
+	UpdatedAt    time.Time  `gorm:"column:updated_at" json:"updated_at"`
+	CompletedAt  *time.Time `gorm:"column:completed_at" json:"completed_at"`
+}
+
+func (Job) TableName() string {
+	return "jobs"
+}

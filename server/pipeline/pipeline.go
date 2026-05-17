@@ -1,504 +1,192 @@
 package pipeline
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"sync"
+	"log"
 	"time"
-
-	"github.com/esp32-rss-display/backend/server/config"
-	"github.com/esp32-rss-display/backend/server/database"
-	"github.com/esp32-rss-display/backend/server/logger"
-	"github.com/esp32-rss-display/backend/server/models"
-	"gorm.io/gorm"
 )
 
-var pipelineLog = logger.Get("pipeline")
-
-var (
-	runningMu     sync.Mutex
-	runningTaskID *uint
-)
-
-var ErrTaskRunning = fmt.Errorf("a pipeline task is already running")
-
+// Pipeline is a named, ordered, immutable sequence of steps.
 type Pipeline struct {
-	runner *PythonRunner
-	cfg    config.PipelineConfig
+	name  string
+	steps []Step
 }
 
-func NewPipeline(cfg config.PipelineConfig) *Pipeline {
-	runner := NewPythonRunner(PythonConfig{
-		PythonPath: cfg.PythonPath,
-		ScriptPath: cfg.ScriptPath,
-		DataDir:    cfg.DataDir,
-	})
-	return &Pipeline{
-		runner: runner,
-		cfg:    cfg,
+// New creates a Pipeline. Steps execute in registration order.
+func New(name string, steps ...Step) *Pipeline {
+	return &Pipeline{name: name, steps: steps}
+}
+
+// Name returns the pipeline name.
+func (p *Pipeline) Name() string { return p.name }
+
+// Runner drives Pipeline execution: handles timeouts, retries, persistence, and crash recovery.
+type Runner struct {
+	store  JobStore
+	state  StateManager
+	pipes  map[string]*Pipeline
+	logger *log.Logger
+}
+
+// NewRunner creates a Runner backed by the given store and state manager.
+func NewRunner(store JobStore, state StateManager, logger *log.Logger) *Runner {
+	return &Runner{
+		store:  store,
+		state:  state,
+		pipes:  make(map[string]*Pipeline),
+		logger: logger,
 	}
 }
 
-func (p *Pipeline) Init() error {
-	return p.runner.EnsureDataDir()
-}
-
-type StartResult struct {
-	Task *models.Task
-}
-
-func (p *Pipeline) StartPipeline(deviceID string, timeStart, timeEnd time.Time) (*models.Task, error) {
-	runningMu.Lock()
-	defer runningMu.Unlock()
-
-	if runningTaskID != nil {
-		return nil, ErrTaskRunning
+// Register adds a Pipeline. Returns an error if a pipeline with the same name is already registered.
+func (r *Runner) Register(p *Pipeline) error {
+	if _, ok := r.pipes[p.Name()]; ok {
+		return fmt.Errorf("pipeline: %q already registered", p.Name())
 	}
+	r.pipes[p.Name()] = p
+	return nil
+}
 
-	db := database.GetDB()
+// Submit creates and enqueues a new job, then executes it asynchronously.
+// Returns the persisted JobRecord (with ID populated) immediately.
+func (r *Runner) Submit(ctx context.Context, pipelineName string, input json.RawMessage) (*JobRecord, error) {
+	if _, ok := r.pipes[pipelineName]; !ok {
+		return nil, fmt.Errorf("pipeline: %q not registered", pipelineName)
+	}
+	now := time.Now()
+	job := &JobRecord{
+		PipelineName: pipelineName,
+		Status:       JobPending,
+		Input:        input,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	if err := r.store.Create(job); err != nil {
+		return nil, fmt.Errorf("pipeline: create job: %w", err)
+	}
+	go r.run(context.Background(), job.ID)
+	return job, nil
+}
 
-	device, err := ensureDevice(db, deviceID)
+// Recover resumes all Pending or Running jobs; call once on process restart before serving traffic.
+func (r *Runner) Recover(ctx context.Context) error {
+	jobs, err := r.store.LoadPending()
 	if err != nil {
-		return nil, fmt.Errorf("failed to ensure device: %w", err)
+		return fmt.Errorf("pipeline: load pending jobs: %w", err)
 	}
-
-	task := &models.Task{
-		DeviceID:       device.DeviceID,
-		Status:         "pending",
-		TimeRangeStart: &timeStart,
-		TimeRangeEnd:   &timeEnd,
+	for _, job := range jobs {
+		r.logger.Printf("[pipeline] recovering job %d (%s step=%d)", job.ID, job.PipelineName, job.CurrentStep)
+		go r.run(context.Background(), job.ID)
 	}
-
-	if err := db.Create(task).Error; err != nil {
-		return nil, fmt.Errorf("failed to create task: %w", err)
-	}
-
-	runningTaskID = &task.ID
-	taskIDCopy := task.ID
-
-	go func() {
-		defer func() {
-			runningMu.Lock()
-			if runningTaskID != nil && *runningTaskID == taskIDCopy {
-				runningTaskID = nil
-			}
-			runningMu.Unlock()
-		}()
-
-		p.runPipeline(taskIDCopy)
-	}()
-
-	return task, nil
+	return nil
 }
 
-func (p *Pipeline) IsRunning() bool {
-	runningMu.Lock()
-	defer runningMu.Unlock()
-	return runningTaskID != nil
-}
-
-type stage struct {
-	name string
-	mode string
-}
-
-var stages = []stage{
-	{name: "filtering_l1", mode: "filter_l1"},
-	{name: "crawling", mode: "crawl"},
-	{name: "summarizing", mode: "summarize"},
-	{name: "filtering_l2", mode: "filter_l2"},
-	{name: "composing", mode: "compose"},
-}
-
-func (p *Pipeline) runPipeline(taskID uint) {
-	db := database.GetDB()
-
-	var task models.Task
-	if err := db.First(&task, taskID).Error; err != nil {
-		pipelineLog.Printf("task %d not found: %v", taskID, err)
+// run is the main execution loop; runs in a goroutine.
+func (r *Runner) run(ctx context.Context, jobID uint) {
+	job, err := r.store.Load(jobID)
+	if err != nil {
+		r.logger.Printf("[pipeline] load job %d: %v", jobID, err)
 		return
 	}
 
-	for _, s := range stages {
-		pipelineLog.Printf("task %d: starting stage %s", taskID, s.name)
+	pipe, ok := r.pipes[job.PipelineName]
+	if !ok {
+		r.fail(job, fmt.Sprintf("pipeline %q not registered", job.PipelineName))
+		return
+	}
 
-		if err := db.Model(&task).Update("status", s.name).Error; err != nil {
-			p.failTask(db, &task, fmt.Sprintf("failed to update status to %s: %v", s.name, err))
+	state, err := r.state.Open(jobID)
+	if err != nil {
+		r.fail(job, fmt.Sprintf("open state: %v", err))
+		return
+	}
+	defer r.state.Close(jobID)
+
+	// Write job input to state so all steps can access it.
+	// On crash recovery (CurrentStep > 0), skip if already written.
+	if !state.Has("job_input") {
+		if err := state.Set("job_input", job.Input); err != nil {
+			r.fail(job, fmt.Sprintf("init job_input: %v", err))
 			return
 		}
-
-		inputData, err := p.buildInput(s.mode, &task, db)
-		if err != nil {
-			p.failTask(db, &task, fmt.Sprintf("failed to build input for %s: %v", s.name, err))
+	}
+	// Store the job ID in state for steps that need to write back to the job record.
+	if !state.Has("job_id") {
+		idBytes, _ := json.Marshal(jobID)
+		if err := state.Set("job_id", idBytes); err != nil {
+			r.fail(job, fmt.Sprintf("init job_id: %v", err))
 			return
 		}
+	}
 
-		inputPath := p.runner.InputPath(taskID, s.mode)
-		outputPath := p.runner.OutputPath(taskID, s.mode)
+	for i := job.CurrentStep; i < len(pipe.steps); i++ {
+		step := pipe.steps[i]
+		cfg := step.Config()
 
-		if err := p.runner.WriteJSON(inputPath, inputData); err != nil {
-			p.failTask(db, &task, fmt.Sprintf("failed to write input for %s: %v", s.name, err))
-			return
-		}
+		job.Status = JobRunning
+		job.CurrentStep = i
+		job.UpdatedAt = time.Now()
+		_ = r.store.Save(job)
 
-		if err := p.runner.Run(s.mode, inputPath, outputPath); err != nil {
-			p.failTask(db, &task, fmt.Sprintf("python %s failed: %v", s.mode, err))
-			return
-		}
+		stepCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
+		runErr := r.runWithRetry(stepCtx, step, state, cfg.RetryPolicy)
+		cancel()
 
-		if err := p.applyResult(s.mode, &task, outputPath, db); err != nil {
-			p.failTask(db, &task, fmt.Sprintf("failed to apply result for %s: %v", s.name, err))
-			return
-		}
-
-		pipelineLog.Printf("task %d: completed stage %s", taskID, s.name)
-
-		if err := db.First(&task, taskID).Error; err != nil {
-			pipelineLog.Printf("task %d: failed to reload task: %v", taskID, err)
+		if runErr != nil {
+			r.fail(job, fmt.Sprintf("step %q: %v", step.Name(), runErr))
 			return
 		}
 	}
 
 	now := time.Now()
-	db.Model(&task).Updates(map[string]any{
-		"status":       "completed",
-		"completed_at": &now,
-	})
-	pipelineLog.Printf("task %d: completed", taskID)
+	job.Status = JobCompleted
+	job.CompletedAt = &now
+	job.UpdatedAt = now
+	_ = r.store.Save(job)
+	r.logger.Printf("[pipeline] job %d completed", jobID)
 }
 
-func (p *Pipeline) failTask(db *gorm.DB, task *models.Task, errMsg string) {
-	pipelineLog.Printf("task %d: %s", task.ID, errMsg)
-	db.Model(task).Updates(map[string]any{
-		"status": "failed",
-		"error":  errMsg,
-	})
-}
-
-func (p *Pipeline) buildInput(mode string, task *models.Task, db *gorm.DB) (any, error) {
-	switch mode {
-	case "filter_l1":
-		return p.buildFilterL1Input(task, db)
-	case "crawl":
-		return p.buildCrawlInput(task, db)
-	case "summarize":
-		return p.buildSummarizeInput(task, db)
-	case "filter_l2":
-		return p.buildFilterL2Input(task, db)
-	case "compose":
-		return p.buildComposeInput(task, db)
-	default:
-		return nil, fmt.Errorf("unknown mode: %s", mode)
+// runWithRetry executes a step with exponential-backoff retries.
+// A MaxAttempts value less than 1 is treated as 1 (run at least once).
+func (r *Runner) runWithRetry(ctx context.Context, step Step, state StateAccessor, p RetryPolicy) error {
+	if p.MaxAttempts < 1 {
+		p.MaxAttempts = 1
 	}
-}
-
-func (p *Pipeline) buildFilterL1Input(task *models.Task, db *gorm.DB) (any, error) {
-	device, err := getDevice(db, task.DeviceID)
-	if err != nil {
-		return nil, err
-	}
-
-	items, err := getItemsInRange(db, *task.TimeRangeStart, *task.TimeRangeEnd)
-	if err != nil {
-		return nil, err
-	}
-
-	type itemEntry struct {
-		ID    uint   `json:"id"`
-		Title string `json:"title"`
-		URL   string `json:"url"`
-	}
-
-	entries := make([]itemEntry, len(items))
-	for i, item := range items {
-		entries[i] = itemEntry{ID: item.ID, Title: item.Title, URL: item.URL}
-	}
-
-	return map[string]any{
-		"device": map[string]string{
-			"role":       device.Role,
-			"preference": device.Preference,
-		},
-		"items": entries,
-	}, nil
-}
-
-func (p *Pipeline) buildCrawlInput(task *models.Task, db *gorm.DB) (any, error) {
-	ids, err := parseIDsFromJSON(task.Level1IDs)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse level1_ids: %w", err)
-	}
-
-	var items []models.Item
-	if err := db.Where("id IN ?", ids).Find(&items).Error; err != nil {
-		return nil, err
-	}
-
-	type itemEntry struct {
-		ID  uint   `json:"id"`
-		URL string `json:"url"`
-	}
-
-	entries := make([]itemEntry, len(items))
-	for i, item := range items {
-		entries[i] = itemEntry{ID: item.ID, URL: item.URL}
-	}
-
-	return map[string]any{
-		"rate_limit_min_seconds": p.cfg.RateLimitMinSeconds,
-		"rate_limit_max_seconds": p.cfg.RateLimitMaxSeconds,
-		"items":                  entries,
-	}, nil
-}
-
-func (p *Pipeline) buildSummarizeInput(task *models.Task, db *gorm.DB) (any, error) {
-	ids, err := parseIDsFromJSON(task.Level1IDs)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse level1_ids: %w", err)
-	}
-
-	var items []models.Item
-	if err := db.Where("id IN ? AND content != ''", ids).Find(&items).Error; err != nil {
-		return nil, err
-	}
-
-	type itemEntry struct {
-		ID      uint   `json:"id"`
-		Title   string `json:"title"`
-		Content string `json:"content"`
-	}
-
-	entries := make([]itemEntry, len(items))
-	for i, item := range items {
-		entries[i] = itemEntry{ID: item.ID, Title: item.Title, Content: item.Content}
-	}
-
-	return map[string]any{
-		"items": entries,
-	}, nil
-}
-
-func (p *Pipeline) buildFilterL2Input(task *models.Task, db *gorm.DB) (any, error) {
-	device, err := getDevice(db, task.DeviceID)
-	if err != nil {
-		return nil, err
-	}
-
-	ids, err := parseIDsFromJSON(task.Level1IDs)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse level1_ids: %w", err)
-	}
-
-	var items []models.Item
-	if err := db.Where("id IN ? AND abstract != ''", ids).Find(&items).Error; err != nil {
-		return nil, err
-	}
-
-	type itemEntry struct {
-		ID       uint   `json:"id"`
-		Title    string `json:"title"`
-		Abstract string `json:"abstract"`
-	}
-
-	entries := make([]itemEntry, len(items))
-	for i, item := range items {
-		entries[i] = itemEntry{ID: item.ID, Title: item.Title, Abstract: item.Abstract}
-	}
-
-	return map[string]any{
-		"device": map[string]string{
-			"role":       device.Role,
-			"preference": device.Preference,
-		},
-		"items": entries,
-	}, nil
-}
-
-func (p *Pipeline) buildComposeInput(task *models.Task, db *gorm.DB) (any, error) {
-	device, err := getDevice(db, task.DeviceID)
-	if err != nil {
-		return nil, err
-	}
-
-	ids, err := parseIDsFromJSON(task.Level2IDs)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse level2_ids: %w", err)
-	}
-
-	var items []models.Item
-	if err := db.Where("id IN ?", ids).Find(&items).Error; err != nil {
-		return nil, err
-	}
-
-	type itemEntry struct {
-		ID       uint   `json:"id"`
-		Title    string `json:"title"`
-		Abstract string `json:"abstract"`
-		URL      string `json:"url"`
-	}
-
-	entries := make([]itemEntry, len(items))
-	for i, item := range items {
-		entries[i] = itemEntry{ID: item.ID, Title: item.Title, Abstract: item.Abstract, URL: item.URL}
-	}
-
-	return map[string]any{
-		"device": map[string]string{
-			"role":       device.Role,
-			"preference": device.Preference,
-		},
-		"items": entries,
-	}, nil
-}
-
-func (p *Pipeline) applyResult(mode string, task *models.Task, outputPath string, db *gorm.DB) error {
-	switch mode {
-	case "filter_l1":
-		return p.applyFilterL1Result(task, outputPath, db)
-	case "crawl":
-		return p.applyCrawlResult(task, outputPath, db)
-	case "summarize":
-		return p.applySummarizeResult(task, outputPath, db)
-	case "filter_l2":
-		return p.applyFilterL2Result(task, outputPath, db)
-	case "compose":
-		return p.applyComposeResult(task, outputPath, db)
-	default:
-		return fmt.Errorf("unknown mode: %s", mode)
-	}
-}
-
-func (p *Pipeline) applyFilterL1Result(task *models.Task, outputPath string, db *gorm.DB) error {
-	var result struct {
-		Level1IDs []uint `json:"level1_ids"`
-	}
-	if err := p.runner.ReadJSON(outputPath, &result); err != nil {
-		return err
-	}
-
-	idsJSON, err := json.Marshal(result.Level1IDs)
-	if err != nil {
-		return err
-	}
-
-	return db.Model(task).Update("level1_ids", string(idsJSON)).Error
-}
-
-func (p *Pipeline) applyCrawlResult(task *models.Task, outputPath string, db *gorm.DB) error {
-	var result struct {
-		Results []struct {
-			ID      uint   `json:"id"`
-			Content string `json:"content"`
-			Success bool   `json:"success"`
-			Error   string `json:"error"`
-		} `json:"results"`
-	}
-	if err := p.runner.ReadJSON(outputPath, &result); err != nil {
-		return err
-	}
-
-	for _, r := range result.Results {
-		if r.Success && r.Content != "" {
-			if err := db.Model(&models.Item{}).Where("id = ?", r.ID).Update("content", r.Content).Error; err != nil {
-				pipelineLog.Printf("failed to update content for item %d: %v", r.ID, err)
-			}
+	var lastErr error
+	for attempt := 1; attempt <= p.MaxAttempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if err := step.Run(ctx, state); err == nil {
+			return nil
 		} else {
-			pipelineLog.Printf("crawl failed for item %d: %s", r.ID, r.Error)
+			lastErr = err
 		}
-	}
-
-	return nil
-}
-
-func (p *Pipeline) applySummarizeResult(task *models.Task, outputPath string, db *gorm.DB) error {
-	var result struct {
-		Results []struct {
-			ID       uint   `json:"id"`
-			Abstract string `json:"abstract"`
-		} `json:"results"`
-	}
-	if err := p.runner.ReadJSON(outputPath, &result); err != nil {
-		return err
-	}
-
-	for _, r := range result.Results {
-		if r.Abstract != "" {
-			if err := db.Model(&models.Item{}).Where("id = ?", r.ID).Update("abstract", r.Abstract).Error; err != nil {
-				pipelineLog.Printf("failed to update abstract for item %d: %v", r.ID, err)
+		if attempt < p.MaxAttempts {
+			delay := p.BaseDelay * (1 << uint(attempt-1))
+			if delay > p.MaxDelay {
+				delay = p.MaxDelay
+			}
+			r.logger.Printf("[pipeline] step %q attempt %d/%d failed: %v, retrying in %v",
+				step.Name(), attempt, p.MaxAttempts, lastErr, delay)
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return ctx.Err()
 			}
 		}
 	}
-
-	return nil
+	return lastErr
 }
 
-func (p *Pipeline) applyFilterL2Result(task *models.Task, outputPath string, db *gorm.DB) error {
-	var result struct {
-		Level2IDs []uint `json:"level2_ids"`
-	}
-	if err := p.runner.ReadJSON(outputPath, &result); err != nil {
-		return err
-	}
-
-	idsJSON, err := json.Marshal(result.Level2IDs)
-	if err != nil {
-		return err
-	}
-
-	return db.Model(task).Update("level2_ids", string(idsJSON)).Error
-}
-
-func (p *Pipeline) applyComposeResult(task *models.Task, outputPath string, db *gorm.DB) error {
-	var result struct {
-		Report string `json:"report"`
-	}
-	if err := p.runner.ReadJSON(outputPath, &result); err != nil {
-		return err
-	}
-
-	return db.Model(task).Update("report", result.Report).Error
-}
-
-func ensureDevice(db *gorm.DB, deviceID string) (*models.Device, error) {
-	var device models.Device
-	if err := db.Where("device_id = ?", deviceID).First(&device).Error; err != nil {
-		device = models.Device{
-			DeviceID:  deviceID,
-			CreatedAt: time.Now(),
-			LastSeen:  time.Now(),
-		}
-		if err := db.Create(&device).Error; err != nil {
-			return nil, err
-		}
-	}
-	return &device, nil
-}
-
-func getDevice(db *gorm.DB, deviceID string) (*models.Device, error) {
-	var device models.Device
-	if err := db.Where("device_id = ?", deviceID).First(&device).Error; err != nil {
-		return nil, err
-	}
-	return &device, nil
-}
-
-func getItemsInRange(db *gorm.DB, start, end time.Time) ([]models.Item, error) {
-	var items []models.Item
-	err := db.Where(
-		db.Where("published_at BETWEEN ? AND ?", start, end).
-			Or("published_at IS NULL AND created_at BETWEEN ? AND ?", start, end),
-	).Order("id ASC").
-		Find(&items).Error
-	return items, err
-}
-
-func parseIDsFromJSON(jsonStr string) ([]uint, error) {
-	if jsonStr == "" {
-		return nil, nil
-	}
-	var ids []uint
-	if err := json.Unmarshal([]byte(jsonStr), &ids); err != nil {
-		return nil, err
-	}
-	return ids, nil
+func (r *Runner) fail(job *JobRecord, msg string) {
+	job.Status = JobFailed
+	job.Error = msg
+	job.UpdatedAt = time.Now()
+	_ = r.store.Save(job)
+	r.logger.Printf("[pipeline] job %d failed: %s", job.ID, msg)
 }

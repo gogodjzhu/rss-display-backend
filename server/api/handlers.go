@@ -80,7 +80,7 @@ func (h *Handler) GetNextItem(w http.ResponseWriter, r *http.Request) {
 		metrics.DeviceRegisteredTotal.Add(1)
 	}
 
-	item, err := h.selector.SelectNext(r.Context(), db, device)
+	item, err := h.selector.Select(r.Context(), db, device)
 	if err != nil {
 		http.Error(w, "Failed to select next item", http.StatusInternalServerError)
 		return

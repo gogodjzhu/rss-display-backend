@@ -2,12 +2,13 @@ package api
 
 import (
 	"context"
-	"math/rand"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/esp32-rss-display/backend/server/database"
+	"github.com/esp32-rss-display/backend/server/domain/items"
 	"github.com/esp32-rss-display/backend/server/models"
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
@@ -18,7 +19,7 @@ func TestWeightedNextItemSelectorReturnsPlaceholderWhenNoItems(t *testing.T) {
 	db := newTestDB(t)
 	selector := newSeededSelector(time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC), 1)
 
-	item, err := selector.SelectNext(context.Background(), db, models.Device{})
+	item, err := selector.Select(context.Background(), db, models.Device{})
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
@@ -42,7 +43,7 @@ func TestWeightedNextItemSelectorPrefersRecentItems(t *testing.T) {
 	selector := newSeededSelector(now, 42)
 	counts := map[uint]int{}
 	for range 4000 {
-		item, err := selector.SelectNext(context.Background(), db, models.Device{})
+		item, err := selector.Select(context.Background(), db, models.Device{})
 		if err != nil {
 			t.Fatalf("SelectNext returned error: %v", err)
 		}
@@ -63,8 +64,8 @@ func TestWeightedNextItemSelectorAvoidsImmediateSequentialItems(t *testing.T) {
 	feed := createTestFeed(t, db, "news", true)
 
 	items := make([]models.Item, 0, 5)
-	for range 5 {
-		items = append(items, createTestItem(t, db, feed.ID, "item", now.Add(-24*time.Hour), nil))
+	for i := range 5 {
+		items = append(items, createTestItem(t, db, feed.ID, fmt.Sprintf("item-%d", i), now.Add(-24*time.Hour), nil))
 	}
 
 	selector := newSeededSelector(now, 7)
@@ -72,7 +73,7 @@ func TestWeightedNextItemSelectorAvoidsImmediateSequentialItems(t *testing.T) {
 	counts := map[uint]int{}
 
 	for range 4000 {
-		item, err := selector.SelectNext(context.Background(), db, device)
+		item, err := selector.Select(context.Background(), db, device)
 		if err != nil {
 			t.Fatalf("SelectNext returned error: %v", err)
 		}
@@ -91,13 +92,7 @@ func TestWeightedNextItemSelectorAvoidsImmediateSequentialItems(t *testing.T) {
 }
 
 func newSeededSelector(now time.Time, seed int64) *WeightedNextItemSelector {
-	rng := rand.New(rand.NewSource(seed))
-	return &WeightedNextItemSelector{
-		now: func() time.Time {
-			return now
-		},
-		randFloat64: rng.Float64,
-	}
+	return items.NewSeededItemSelector(now, seed)
 }
 
 func newTestDB(t *testing.T) *gorm.DB {

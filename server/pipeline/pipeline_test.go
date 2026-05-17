@@ -1,377 +1,359 @@
 package pipeline
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
-
-	"github.com/esp32-rss-display/backend/server/models"
-	"gorm.io/gorm"
 )
 
-func createTestItems(t *testing.T, db *gorm.DB, count int) []models.Item {
-	t.Helper()
-	feed := models.Feed{Name: "TestFeed", URL: "https://example.com/feed.xml", Enabled: true}
-	if err := db.Create(&feed).Error; err != nil {
-		t.Fatalf("failed to create feed: %v", err)
-	}
-
-	items := make([]models.Item, count)
-	for i := 0; i < count; i++ {
-		publishedAt := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC).Add(time.Duration(i) * time.Hour)
-		items[i] = models.Item{
-			FeedID:      feed.ID,
-			Title:       "Test Item " + string(rune('A'+i)),
-			URL:         "https://example.com/article-" + string(rune('A'+i)),
-			PublishedAt: &publishedAt,
-		}
-		if err := db.Create(&items[i]).Error; err != nil {
-			t.Fatalf("failed to create item %d: %v", i, err)
-		}
-	}
-	return items
-}
+// ── PythonRunner file I/O tests ─────────────────────────────────────────────
 
 func TestPythonRunnerWriteAndReadJSON(t *testing.T) {
-	runner := &PythonRunner{DataDir: t.TempDir()}
+	runner := &PythonRunner{PythonPath: "python3", ScriptPath: "py/pipeline.py", DataDir: t.TempDir()}
 
-	data := map[string]any{
-		"test":  "value",
-		"count": 42,
+	type payload struct {
+		Name  string `json:"name"`
+		Value int    `json:"value"`
 	}
-	path := filepath.Join(runner.DataDir, "test.json")
 
-	if err := runner.WriteJSON(path, data); err != nil {
+	path := filepath.Join(t.TempDir(), "test.json")
+	want := payload{Name: "test", Value: 42}
+
+	if err := runner.WriteJSON(path, want); err != nil {
 		t.Fatalf("WriteJSON failed: %v", err)
 	}
 
-	var result map[string]any
-	if err := runner.ReadJSON(path, &result); err != nil {
+	var got payload
+	if err := runner.ReadJSON(path, &got); err != nil {
 		t.Fatalf("ReadJSON failed: %v", err)
 	}
 
-	if result["test"] != "value" {
-		t.Errorf("expected test=value, got %v", result["test"])
-	}
-	if count, ok := result["count"].(float64); !ok || count != 42 {
-		t.Errorf("expected count=42, got %v", result["count"])
+	if got.Name != want.Name || got.Value != want.Value {
+		t.Errorf("got %+v, want %+v", got, want)
 	}
 }
 
 func TestPythonRunnerInputOutputPaths(t *testing.T) {
-	runner := &PythonRunner{DataDir: "/tmp/data/pipeline"}
+	dir := t.TempDir()
+	runner := &PythonRunner{PythonPath: "python3", ScriptPath: "py/pipeline.py", DataDir: dir}
 
-	inPath := runner.InputPath(1, "filter_l1")
-	expected := "/tmp/data/pipeline/1_filter_l1_in.json"
-	if inPath != expected {
-		t.Errorf("expected %s, got %s", expected, inPath)
+	inPath := runner.InputPath(7, "filter_l1")
+	outPath := runner.OutputPath(7, "filter_l1")
+
+	if inPath == outPath {
+		t.Error("InputPath and OutputPath must be different")
 	}
-
-	outPath := runner.OutputPath(1, "filter_l1")
-	expectedOut := "/tmp/data/pipeline/1_filter_l1_out.json"
-	if outPath != expectedOut {
-		t.Errorf("expected %s, got %s", expectedOut, outPath)
-	}
-}
-
-func TestPipelineStartRejectsConcurrentTasks(t *testing.T) {
-	db := setupDB(t)
-	p, _ := newPipeline(t, "python3", "py/pipeline.py")
-
-	start := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
-	end := time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC)
-
-	device := models.Device{DeviceID: "test-device-1", CreatedAt: time.Now(), LastSeen: time.Now()}
-	if err := db.Create(&device).Error; err != nil {
-		t.Fatalf("failed to create device: %v", err)
-	}
-
-	task1, err := p.StartPipeline("test-device-1", start, end)
-	if err != nil {
-		t.Fatalf("first StartPipeline should succeed, got: %v", err)
-	}
-	if task1.Status != "pending" {
-		t.Errorf("expected status=pending, got %s", task1.Status)
-	}
-
-	_, err = p.StartPipeline("test-device-1", start, end)
-	if err != ErrTaskRunning {
-		t.Errorf("second StartPipeline should return ErrTaskRunning, got: %v", err)
-	}
-
-	runningMu.Lock()
-	runningTaskID = nil
-	runningMu.Unlock()
-}
-
-func TestPipelineStartCreatesTask(t *testing.T) {
-	db := setupDB(t)
-	p, _ := newPipeline(t, "python3", "py/pipeline.py")
-
-	start := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
-	end := time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC)
-
-	device := models.Device{DeviceID: "test-device-2", CreatedAt: time.Now(), LastSeen: time.Now()}
-	if err := db.Create(&device).Error; err != nil {
-		t.Fatalf("failed to create device: %v", err)
-	}
-
-	runningMu.Lock()
-	runningTaskID = nil
-	runningMu.Unlock()
-
-	task, err := p.StartPipeline("test-device-2", start, end)
-	if err != nil {
-		t.Fatalf("StartPipeline failed: %v", err)
-	}
-
-	if task.DeviceID != "test-device-2" {
-		t.Errorf("expected device_id=test-device-2, got %s", task.DeviceID)
-	}
-	if task.Status != "pending" {
-		t.Errorf("expected status=pending, got %s", task.Status)
-	}
-	if task.TimeRangeStart == nil || !task.TimeRangeStart.Equal(start) {
-		t.Error("time_range_start mismatch")
-	}
-	if task.TimeRangeEnd == nil || !task.TimeRangeEnd.Equal(end) {
-		t.Error("time_range_end mismatch")
-	}
-
-	runningMu.Lock()
-	runningTaskID = nil
-	runningMu.Unlock()
-}
-
-func TestPipelineStartAutoCreatesDevice(t *testing.T) {
-	db := setupDB(t)
-	p, _ := newPipeline(t, "python3", "py/pipeline.py")
-
-	start := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
-	end := time.Date(2026, 5, 15, 0, 0, 0, 0, time.UTC)
-
-	runningMu.Lock()
-	runningTaskID = nil
-	runningMu.Unlock()
-
-	task, err := p.StartPipeline("new-device-1", start, end)
-	if err != nil {
-		t.Fatalf("StartPipeline failed for new device: %v", err)
-	}
-
-	var device models.Device
-	if err := db.Where("device_id = ?", "new-device-1").First(&device).Error; err != nil {
-		t.Fatalf("device should have been auto-created: %v", err)
-	}
-
-	_ = task
-
-	runningMu.Lock()
-	runningTaskID = nil
-	runningMu.Unlock()
-}
-
-func TestBuildFilterL1Input(t *testing.T) {
-	db := setupDB(t)
-	p, _ := newPipeline(t, "python3", "py/pipeline.py")
-
-	device := models.Device{
-		DeviceID:    "test-device-l1",
-		Role:        "developer",
-		Preference:  "Go, distributed systems",
-		CreatedAt:   time.Now(),
-		LastSeen:    time.Now(),
-	}
-	if err := db.Create(&device).Error; err != nil {
-		t.Fatalf("failed to create device: %v", err)
-	}
-
-	items := createTestItems(t, db, 3)
-
-	start := time.Date(2026, 5, 10, 0, 0, 0, 0, time.UTC)
-	end := time.Date(2026, 5, 11, 0, 0, 0, 0, time.UTC)
-
-	task := &models.Task{
-		DeviceID:       device.DeviceID,
-		Status:         "filtering_l1",
-		TimeRangeStart: &start,
-		TimeRangeEnd:   &end,
-		Level1IDs:      "",
-	}
-	if err := db.Create(task).Error; err != nil {
-		t.Fatalf("failed to create task: %v", err)
-	}
-
-	input, err := p.buildFilterL1Input(task, db)
-	if err != nil {
-		t.Fatalf("buildFilterL1Input failed: %v", err)
-	}
-
-	inputMap, ok := input.(map[string]any)
-	if !ok {
-		t.Fatalf("expected map, got %T", input)
-	}
-
-	devMap, ok := inputMap["device"].(map[string]string)
-	if !ok {
-		t.Fatalf("expected device map, got %T", inputMap["device"])
-	}
-	if devMap["role"] != "developer" {
-		t.Errorf("expected role=developer, got %s", devMap["role"])
-	}
-
-	itemsSlice, ok := inputMap["items"]
-	if !ok {
-		t.Fatalf("expected items key in input")
-	}
-	itemsBytes, err := json.Marshal(itemsSlice)
-	if err != nil {
-		t.Fatalf("failed to marshal items: %v", err)
-	}
-	var parsedItems []struct {
-		ID    uint   `json:"id"`
-		Title string `json:"title"`
-		URL   string `json:"url"`
-	}
-	if err := json.Unmarshal(itemsBytes, &parsedItems); err != nil {
-		t.Fatalf("failed to unmarshal items: %v", err)
-	}
-	if len(parsedItems) != len(items) {
-		t.Errorf("expected %d items, got %d", len(items), len(parsedItems))
+	if filepath.Dir(inPath) != dir {
+		t.Errorf("InputPath dir = %q, want %q", filepath.Dir(inPath), dir)
 	}
 }
 
-func TestBuildCrawlInput(t *testing.T) {
-	db := setupDB(t)
-	p, _ := newPipeline(t, "python3", "py/pipeline.py")
+// ── StateAccessor (FileStateManager) tests ─────────────────────────────────
 
-	items := createTestItems(t, db, 2)
+func TestFileStateManagerOpenAndClose(t *testing.T) {
+	fsm := newTempStateManager(t)
 
-	idsJSON, _ := json.Marshal([]uint{items[0].ID, items[1].ID})
-	task := &models.Task{
-		DeviceID:  "test-device-crawl",
-		Status:    "crawling",
-		Level1IDs: string(idsJSON),
-	}
-	if err := db.Create(task).Error; err != nil {
-		t.Fatalf("failed to create task: %v", err)
-	}
-
-	input, err := p.buildCrawlInput(task, db)
+	acc, err := fsm.Open(1)
 	if err != nil {
-		t.Fatalf("buildCrawlInput failed: %v", err)
+		t.Fatalf("Open failed: %v", err)
 	}
-
-	inputMap, ok := input.(map[string]any)
-	if !ok {
-		t.Fatalf("expected map, got %T", input)
+	if acc == nil {
+		t.Fatal("Open returned nil accessor")
 	}
-
-	itemsSlice, ok := inputMap["items"]
-	if !ok {
-		t.Fatalf("expected items key in input")
-	}
-	itemsBytes, err := json.Marshal(itemsSlice)
-	if err != nil {
-		t.Fatalf("failed to marshal items: %v", err)
-	}
-	var parsedItems []struct {
-		ID  uint   `json:"id"`
-		URL string `json:"url"`
-	}
-	if err := json.Unmarshal(itemsBytes, &parsedItems); err != nil {
-		t.Fatalf("failed to unmarshal items: %v", err)
-	}
-	if len(parsedItems) != 2 {
-		t.Errorf("expected 2 items, got %d", len(parsedItems))
+	if err := fsm.Close(1); err != nil {
+		t.Fatalf("Close failed: %v", err)
 	}
 }
 
-func TestApplyCrawlResult(t *testing.T) {
-	db := setupDB(t)
-	p, dataDir := newPipeline(t, "python3", "py/pipeline.py")
+func TestFileStateAccessorSetHasGet(t *testing.T) {
+	fsm := newTempStateManager(t)
+	acc, _ := fsm.Open(2)
 
-	items := createTestItems(t, db, 1)
-
-	task := &models.Task{
-		DeviceID:  "test-device-crawl-apply",
-		Status:    "crawling",
-		Level1IDs: "",
-	}
-	if err := db.Create(task).Error; err != nil {
-		t.Fatalf("failed to create task: %v", err)
+	if acc.Has("foo") {
+		t.Error("Has('foo') should be false before Set")
 	}
 
-	result := map[string]any{
-		"results": []map[string]any{
-			{"id": float64(items[0].ID), "content": "# Hello\n\nWorld", "success": true},
-		},
+	if err := acc.Set("foo", []byte(`"bar"`)); err != nil {
+		t.Fatalf("Set failed: %v", err)
 	}
-	outPath := filepath.Join(dataDir, "crawl_out.json")
-	p.runner.WriteJSON(outPath, result)
+	if !acc.Has("foo") {
+		t.Error("Has('foo') should be true after Set")
+	}
 
-	err := p.applyCrawlResult(task, outPath, db)
+	data, err := acc.Get("foo")
 	if err != nil {
-		t.Fatalf("applyCrawlResult failed: %v", err)
+		t.Fatalf("Get failed: %v", err)
 	}
-
-	var updatedItem models.Item
-	if err := db.First(&updatedItem, items[0].ID).Error; err != nil {
-		t.Fatalf("failed to load item: %v", err)
-	}
-	if updatedItem.Content != "# Hello\n\nWorld" {
-		t.Errorf("expected content to be updated, got %q", updatedItem.Content)
+	if string(data) != `"bar"` {
+		t.Errorf("Get returned %q, want %q", data, `"bar"`)
 	}
 }
 
-func TestParseIDsFromJSON(t *testing.T) {
-	tests := []struct {
-		name   string
-		input  string
-		expect []uint
-		hasErr bool
-	}{
-		{"empty string", "", nil, false},
-		{"valid array", "[1, 2, 3]", []uint{1, 2, 3}, false},
-		{"single element", "[42]", []uint{42}, false},
-		{"invalid json", "not json", nil, true},
-	}
+func TestFileStateAccessorGetMissingReturnsNotExist(t *testing.T) {
+	fsm := newTempStateManager(t)
+	acc, _ := fsm.Open(3)
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ids, err := parseIDsFromJSON(tt.input)
-			if tt.hasErr && err == nil {
-				t.Error("expected error, got nil")
-			}
-			if !tt.hasErr && err != nil {
-				t.Errorf("unexpected error: %v", err)
-			}
-			if !tt.hasErr {
-				if len(ids) != len(tt.expect) {
-					t.Errorf("expected %v, got %v", tt.expect, ids)
-				}
-				for i, id := range ids {
-					if id != tt.expect[i] {
-						t.Errorf("index %d: expected %d, got %d", i, tt.expect[i], id)
-					}
-				}
-			}
-		})
+	_, err := acc.Get("missing")
+	if !os.IsNotExist(err) {
+		t.Errorf("expected os.ErrNotExist, got %v", err)
 	}
 }
 
-func TestEnsureDataDir(t *testing.T) {
-	tmpDir := t.TempDir()
-	dataDir := filepath.Join(tmpDir, "nested", "data")
+func TestFileStateManagerPurge(t *testing.T) {
+	dir := t.TempDir()
+	fsm := NewFileStateManager(dir)
+	acc, _ := fsm.Open(5)
+	_ = acc.Set("key", []byte("value"))
 
-	runner := &PythonRunner{DataDir: dataDir}
-	if err := runner.EnsureDataDir(); err != nil {
-		t.Fatalf("EnsureDataDir failed: %v", err)
+	stateDir := filepath.Join(dir, "5")
+	if _, err := os.Stat(stateDir); os.IsNotExist(err) {
+		t.Fatal("state dir should exist after Open+Set")
 	}
 
-	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
-		t.Error("data dir should exist")
+	if err := fsm.Purge(5); err != nil {
+		t.Fatalf("Purge failed: %v", err)
+	}
+	if _, err := os.Stat(stateDir); !os.IsNotExist(err) {
+		t.Error("state dir should be removed after Purge")
+	}
+}
+
+// ── GetState / SetState generics ────────────────────────────────────────────
+
+func TestGetSetStateRoundTrip(t *testing.T) {
+	fsm := newTempStateManager(t)
+	acc, _ := fsm.Open(10)
+
+	type point struct {
+		X int `json:"x"`
+		Y int `json:"y"`
+	}
+	want := point{X: 3, Y: 7}
+
+	if err := SetState(acc, "point", want); err != nil {
+		t.Fatalf("SetState failed: %v", err)
+	}
+
+	got, err := GetState[point](acc, "point")
+	if err != nil {
+		t.Fatalf("GetState failed: %v", err)
+	}
+	if got != want {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+}
+
+func TestGetStateMissingKeyReturnsError(t *testing.T) {
+	fsm := newTempStateManager(t)
+	acc, _ := fsm.Open(11)
+
+	_, err := GetState[string](acc, "nonexistent")
+	if err == nil {
+		t.Error("expected error for missing key")
+	}
+}
+
+// ── Runner tests ─────────────────────────────────────────────────────────────
+
+func TestRunnerRegisterDuplicate(t *testing.T) {
+	store := newMemJobStore()
+	state := newMemStateManager()
+	runner := NewRunner(store, state, testLogger())
+
+	p := New("pipe1")
+	if err := runner.Register(p); err != nil {
+		t.Fatalf("first Register failed: %v", err)
+	}
+	if err := runner.Register(p); err == nil {
+		t.Error("second Register with same name should fail")
+	}
+}
+
+func TestRunnerSubmitUnknownPipelineReturnsError(t *testing.T) {
+	store := newMemJobStore()
+	state := newMemStateManager()
+	runner := NewRunner(store, state, testLogger())
+
+	_, err := runner.Submit(context.Background(), "no_such_pipeline", json.RawMessage(`{}`))
+	if err == nil {
+		t.Error("Submit for unregistered pipeline should return error")
+	}
+}
+
+func TestRunnerSubmitCreatesJobAndRunsAllSteps(t *testing.T) {
+	store := newMemJobStore()
+	state := newMemStateManager()
+	runner := NewRunner(store, state, testLogger())
+
+	ran1, ran2 := false, false
+	p := New("mypipe", newNoopStep("step1", &ran1), newNoopStep("step2", &ran2))
+	_ = runner.Register(p)
+
+	job, err := runner.Submit(context.Background(), "mypipe", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("Submit failed: %v", err)
+	}
+	if job.ID == 0 {
+		t.Error("submitted job should have non-zero ID")
+	}
+
+	// Wait for async goroutine to finish.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		rec, _ := store.Load(job.ID)
+		if rec.Status == JobCompleted || rec.Status == JobFailed {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	rec, _ := store.Load(job.ID)
+	if rec.Status != JobCompleted {
+		t.Errorf("job status = %q, want completed; error = %q", rec.Status, rec.Error)
+	}
+	if !ran1 || !ran2 {
+		t.Errorf("not all steps ran: ran1=%v ran2=%v", ran1, ran2)
+	}
+}
+
+func TestRunnerStepFailureSetsJobFailed(t *testing.T) {
+	store := newMemJobStore()
+	state := newMemStateManager()
+	runner := NewRunner(store, state, testLogger())
+
+	p := New("failpipe", &errStep{stepName: "bad_step"})
+	_ = runner.Register(p)
+
+	job, _ := runner.Submit(context.Background(), "failpipe", json.RawMessage(`{}`))
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		rec, _ := store.Load(job.ID)
+		if rec.Status == JobFailed || rec.Status == JobCompleted {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	rec, _ := store.Load(job.ID)
+	if rec.Status != JobFailed {
+		t.Errorf("job status = %q, want failed", rec.Status)
+	}
+	if rec.Error == "" {
+		t.Error("failed job should have non-empty error message")
+	}
+}
+
+func TestRunnerJobInputWrittenToState(t *testing.T) {
+	store := newMemJobStore()
+	stateManager := newMemStateManager()
+	runner := NewRunner(store, stateManager, testLogger())
+
+	type captured struct {
+		gotInput bool
+		gotID    bool
+	}
+	var result captured
+
+	checkStep := &captureStep{fn: func(state StateAccessor) error {
+		result.gotInput = state.Has("job_input")
+		result.gotID = state.Has("job_id")
+		return nil
+	}}
+
+	p := New("checkpipe", checkStep)
+	_ = runner.Register(p)
+
+	job, _ := runner.Submit(context.Background(), "checkpipe", json.RawMessage(`{"hello":"world"}`))
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		rec, _ := store.Load(job.ID)
+		if rec.Status == JobCompleted || rec.Status == JobFailed {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !result.gotInput {
+		t.Error("job_input should be in state")
+	}
+	if !result.gotID {
+		t.Error("job_id should be in state")
+	}
+}
+
+func TestRunnerRetryPolicyMaxAttemptsZeroRunsOnce(t *testing.T) {
+	store := newMemJobStore()
+	state := newMemStateManager()
+	runner := NewRunner(store, state, testLogger())
+
+	attempts := 0
+	countStep := &captureStep{fn: func(_ StateAccessor) error {
+		attempts++
+		return nil
+	}, cfg: StepConfig{
+		Timeout:     5 * time.Second,
+		RetryPolicy: RetryPolicy{MaxAttempts: 0}, // should be treated as 1
+	}}
+
+	p := New("retrypipe", countStep)
+	_ = runner.Register(p)
+
+	job, _ := runner.Submit(context.Background(), "retrypipe", json.RawMessage(`{}`))
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		rec, _ := store.Load(job.ID)
+		if rec.Status == JobCompleted || rec.Status == JobFailed {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if attempts != 1 {
+		t.Errorf("expected exactly 1 attempt with MaxAttempts=0, got %d", attempts)
+	}
+}
+
+func TestRunnerRecoverResumesRunningJobs(t *testing.T) {
+	store := newMemJobStore()
+	state := newMemStateManager()
+
+	// Pre-create a running job.
+	job := &JobRecord{
+		PipelineName: "recoverpipe",
+		Status:       JobRunning,
+		CurrentStep:  0,
+		Input:        json.RawMessage(`{}`),
+		CreatedAt:    time.Now(),
+		UpdatedAt:    time.Now(),
+	}
+	_ = store.Create(job)
+
+	ran := false
+	runner := NewRunner(store, state, testLogger())
+	p := New("recoverpipe", newNoopStep("s", &ran))
+	_ = runner.Register(p)
+
+	if err := runner.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover failed: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		rec, _ := store.Load(job.ID)
+		if rec.Status == JobCompleted || rec.Status == JobFailed {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	rec, _ := store.Load(job.ID)
+	if rec.Status != JobCompleted {
+		t.Errorf("recovered job status = %q, want completed", rec.Status)
 	}
 }

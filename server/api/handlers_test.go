@@ -17,12 +17,12 @@ import (
 )
 
 type stubSelector struct {
-	item       models.Item
+	item       *models.Item
 	err        error
 	seenDevice models.Device
 }
 
-func (s *stubSelector) SelectNext(_ context.Context, _ *gorm.DB, device models.Device) (models.Item, error) {
+func (s *stubSelector) Select(_ context.Context, _ *gorm.DB, device models.Device) (*models.Item, error) {
 	s.seenDevice = device
 	return s.item, s.err
 }
@@ -31,7 +31,8 @@ func TestGetNextItemRegistersDeviceAndUpdatesState(t *testing.T) {
 	db := newTestDB(t)
 	now := time.Date(2026, 5, 4, 12, 30, 0, 0, time.UTC)
 	feed := createTestFeed(t, db, "feed-a", true)
-	item := createTestItem(t, db, feed.ID, "fresh", now.Add(-time.Hour), nil)
+	itemVal := createTestItem(t, db, feed.ID, "fresh", now.Add(-time.Hour), nil)
+	item := &itemVal
 	selector := &stubSelector{item: item}
 	handler := &Handler{
 		selector: selector,
@@ -103,7 +104,7 @@ func TestGetNextItemReturnsPlaceholderWhenSelectorHasNoItems(t *testing.T) {
 	db := newTestDB(t)
 	now := time.Date(2026, 5, 4, 12, 30, 0, 0, time.UTC)
 	handler := &Handler{
-		selector: &stubSelector{item: models.Item{ID: PlaceholderItemID, Title: PlaceholderTitle}},
+		selector: &stubSelector{item: &models.Item{ID: PlaceholderItemID, Title: PlaceholderTitle}},
 		now: func() time.Time {
 			return now
 		},
